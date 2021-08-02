@@ -1,0 +1,12 @@
+BlockDeviceMappings:
+- DeviceName: /dev/xvda
+  Ebs:
+    DeleteOnTermination: true
+    VolumeSize: 105
+ImageId: ami-0d1981233d9ae1ea5
+InstanceType: g4dn.xlarge
+KeyName: lior
+MaxCount: 1
+MinCount: 1
+SecurityGroups:
+- DL
