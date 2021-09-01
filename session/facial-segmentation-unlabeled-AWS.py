@@ -1,4 +1,5 @@
 import subprocess
+import argparse
 from unet_segmentor_lib import *
 from gan_segmentor_lib import *
 
@@ -9,8 +10,8 @@ subprocess.run(["nvidia-smi", "-L"])
 # tf.config.run_functions_eagerly(True) 
 
 
-def main_unet():
-    station = "home"
+def main_unet(station):
+    # station = "home"
     # station = "aws"
     train = False
     evaluate = False
@@ -244,7 +245,7 @@ def main_unet():
     # due to the UNET's skip connections.
 
 
-def main_gan():
+def main_gan(station):
     # # Attempt #2
     #
     # We will use a GAN architecture similar to infoGAN: https://arxiv.org/pdf/1606.03657.pdf
@@ -273,7 +274,7 @@ def main_gan():
     # In drawing samples from the latent space, we use a gaussian of unit variance.
     # Since each pixel has N components in the code, we need each component to be a gaussian of variance 1/sqrt(N)
     # (this way the total variance is 1).
-    station = "home"
+    # station = "home"
     # station = "aws"
     home = None
     if station == "aws":
@@ -342,3 +343,16 @@ def main_gan():
                     ]
         gan_trainer.fit(train_dataset, epochs=3, validation_data=val_dataset, validation_steps=5, validation_freq=1,
                         workers=3, callbacks=callbacks)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--v", dest="v", type=int, choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan")
+    parser.add_argument("--station", dest="station", type=str, choices={"aws", "home"}, default="aws", required=False)
+    args = parser.parse_args()
+
+    if args.v == 1:
+        main_unet(args.station)
+
+    elif args.v == 2:
+        main_gan(args.station)
