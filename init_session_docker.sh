@@ -18,14 +18,14 @@ echo "unpacking session"
 cmd="${sshcmd} '"'unzip session.zip'"'"
 # echo $cmd
 eval $cmd
-cmd1="${sshcmd} '"'source activate tensorflow2_latest_p37'"'"
-cmd2="${sshcmd} '"'/home/ec2-user/anaconda3/envs/tensorflow2_latest_p37/bin/python -m pip install --upgrade pip'"'"
-cmd3="${sshcmd} '"'pip install --upgrade tensorflow --pre'"'"
-echo "upgrading tensorflow"
-eval $cmd1
-eval $cmd2
+
+cmd1="${sshcmd} '"'docker pull tensorflow/tensorflow:latest-gpu-jupyter'"'"
+cmd2="${sshcmd} '"'docker run -it --rm -v $PWD:/tmp -w /tmp -p 8888:8888 -p 6006:6006 tensorflow/tensorflow:latest-gpu'"'"
+eval cmd1
+eval cmd2
 
 echo "run: jupyter notebook & -> disown -h %1"
+echo "docker run -it --rm -v $PWD:/tmp -w /tmp -p 8888:8888 tensorflow/tensorflow:latest-gpu-jupyter"
 echo "open tunnel"
 echo "$cmd"
 cmd="ssh -L localhost:8888:localhost:8888 -i ~/.ssh/lior.pem ec2-user@${addr}"
