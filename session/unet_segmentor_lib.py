@@ -6,7 +6,6 @@ import tensorflow as tf
 import tensorflow.keras as keras
 import matplotlib.pyplot as plt
 
-
 @tf.function
 def image_float_to_int(image):
     return tf.image.convert_image_dtype(image, tf.uint8)
@@ -504,6 +503,12 @@ def do_model(image, gt, w, model):
     result = tf.reshape(result, shape)
     gt = tf.reshape(gt, shape)
     return image, gt, w, result
+
+
+def get_apply_model(model):
+    def f(x, y, z):
+        do_model(x, y, z, model)
+    return f
 
 
 def interpolate(colormap, x):

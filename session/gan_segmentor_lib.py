@@ -588,3 +588,11 @@ class InfoWGAN(keras.Model):
                 #                 "info_loss": info_loss,
                 "gradient_penalty_loss": penalty_loss}
 
+
+@tf.function
+def load_image(file_path, img_size=[306, 306]):
+    raw = tf.io.read_file(file_path)
+    img = tf.image.decode_jpeg(raw, channels=3)
+    img = tf.image.convert_image_dtype(img, dtype=tf.float32)
+    img = (img - 0.5) * 2 # normalizing the images to [-1, 1]
+    return img
