@@ -1,13 +1,8 @@
+import platform
 import subprocess
 import argparse
 from unet_segmentor_lib import *
 from gan_segmentor_lib import *
-
-print(tf.version.VERSION)
-subprocess.run(["nvidia-smi", "-L"])
-
-# uncomment for debugging layers
-# tf.config.run_functions_eagerly(True) 
 
 
 def main_unet(station):
@@ -349,7 +344,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--v", dest="v", type=int, choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan")
     parser.add_argument("--station", dest="station", type=str, choices={"aws", "home"}, default="aws", required=False)
+    parser.add_argument("--debug", dest="station", type=bool, default=False, required=False)
     args = parser.parse_args()
+
+    print(f"running tensorflow version {tf.version.VERSION}")
+    subprocess.run(["nvidia-smi", "-L"])
+
+    if args.debug:
+        tf.config.run_functions_eagerly(True)
 
     if args.v == 1:
         main_unet(args.station)
