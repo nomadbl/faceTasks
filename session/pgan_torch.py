@@ -1,13 +1,14 @@
 import glob
-import yaml
-from yaml import Loader, Dumper
+import os
+import random
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 from itertools import chain
 from unet_segmentor_lib import *
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision
 import functools
-import numpy as np
 
 C_AXIS = 1
 
@@ -314,14 +315,17 @@ class Encoder(torch.nn.Module):
         avg_pooling2d_dims = dims
         avg_pooling2d_dims.update_dims(DimsTransformer(size_transform=lambda x: int(x/2)))
         # fade in layers
-        self.fromGRB, _ = new_conv2d(avg_pooling2d_dims, f, kernel_size=(1, 1))
-        self.encoder_block = EncoderBlock(dims.curr_dim(), f)
+        self.from_rgb, _ = new_conv2d(avg_pooling2d_dims, f, kernel_size=(1, 1))
+        encoder_blocks = [EncoderBlock(dims.curr_dim(), f)]
         dims.update_dims(transform=lambda _: self.encoder_block.out_dims)
-        self.encoder_blocks = []
+
         for i, f in enumerate(current_encoder_layers):
-            self.encoder_blocks.append(EncoderBlock(dims.curr_dim(), f))
+            encoder_blocks.append(EncoderBlock(dims.curr_dim(), f))
             dims.update_dims(transform=lambda _: self.encoder_blocks[-1].out_dims)
             print(f"Encoder: output shape={dims.curr_size()}")
+        # We save the blocks in reverse order, so that when we save the oldest block will have index zero.
+        # This way the existing blocks don't change when we add additional ones
+        self.encoder_blocks_reverse = torch.nn.ModuleList(reversed(encoder_blocks))
 
         if eval_model:
             self.eval()
@@ -334,16 +338,15 @@ class Encoder(torch.nn.Module):
         else:
             x, alpha = inputs
         x_prev = x
-        x = self.encoder_block(x)
+        x = self.encoder_blocks_reverse[-1](x)
         if not self.eval_model:
             x_prev = torch.nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2), padding=(1, 1))(x_prev)
-            x_prev = self.fromGRB(x_prev)
+            x_prev = self.from_rgb(x_prev)
             x_prev = x_prev * (1 - alpha)
             x = x * alpha
             x = x + x_prev
-
-        for block in self.encoder_blocks:
-            x = block(x)
+        for i in reversed(range(len(self.encoder_blocks_reverse)-1)):
+            x = self.encoder_blocks_reverse[i](x)
         return x
 
 
@@ -469,7 +472,6 @@ class InfoWGAN:
     def fit(self, files_dir):
         '''
         Custom training loop.
-        wrap the Model.fit function to first call build_models on the correct image shape and
         load models as needed.
         Adjust image inputs to correct resolution
         '''
@@ -497,8 +499,13 @@ class InfoWGAN:
             for epoch in range(start_epoch, self.epochs_per_phase):
                 self.current_alpha = (self.curr_epoch % self.epochs_per_phase + 1) / self.epochs_per_phase
                 train_ds = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
-                for i, batch in enumerate(train_loader):
+                progress_bar = tqdm(enumerate(train_loader))
+                for i, batch in progress_bar:
                     losses = self.train_step(batch)
+                    progress_bar.set_description(f"Epoch {epoch}, critic loss {losses['critic_loss']}")
+                    if i % 100 == 99:
+                        self.save_sample_pics(eval_ds)
+                progress_bar.close()
 
             # checkpoint model
             self.save_cp(0, losses)
@@ -729,3 +736,23 @@ class InfoWGAN:
         return {"critic_loss": -wgan_loss, "generator_loss": g_loss,
                 #                 "info_loss": info_loss,
                 "gradient_penalty_loss": penalty_loss}
+
+    def save_sample_pics(self):
+        with torch.no_grad():
+            current_epoch = torch.Tensor(self.curr_epoch, dtype=torch.float32)
+            alpha = torch.divide(torch.add(torch.fmod(current_epoch, self.epochs_per_phase), 1), self.epochs_per_phase)
+            # Sample random points in the latent space
+            batch_size = 9
+            latent_shape = [batch_size, self.code_shape[1], self.code_shape[2],
+                            self.code_features + self.noise_features]
+            random_latent_vectors = torch.randn(size=latent_shape)
+
+            # Decode them to fake images
+            generated_images = self.generator([random_latent_vectors, alpha])
+            # make and save figure of images
+            fig = plt.figure(figsize=(10, 10))
+            generated_images = torchvision.transforms.ConvertImageDtype(torch.uint8)(generated_images)
+            for i in range(9):
+                plt.subplot(3, 3, i + 1)
+                plt.imshow(generated_images[i])
+            plt.savefig(os.path.join(self.cp_dir, "sample_pics.png"))
