@@ -90,7 +90,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"running pytorch version {torch.__version__}")
-    subprocess.run(["nvidia-smi", "-L"])
+    if args.station == "aws":
+        subprocess.run(["nvidia-smi", "-L"])
 
     # if args.v == 1:
     #     main_unet(args.station)

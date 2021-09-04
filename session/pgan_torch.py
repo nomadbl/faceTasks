@@ -1,6 +1,5 @@
+import copy
 import glob
-import os
-import random
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from itertools import chain
@@ -13,6 +12,38 @@ import functools
 C_AXIS = 1
 
 
+class DimsTracker:
+    def __init__(self, input_dim: list, c_axis=C_AXIS):
+        self.curr_dim = input_dim
+        self.prev_dim = input_dim
+        self.c_axis = c_axis
+
+    def update_dims(self, transform):
+        self.prev_dim = self.curr_dim
+        self.curr_dim = transform(self)
+
+    def get_dims(self):
+        return self.prev_dim, self.curr_dim
+
+    def prev_channels(self):
+        return self.prev_dim[self.c_axis]
+
+    def curr_channels(self):
+        return self.curr_dim[self.c_axis]
+
+    def curr_size(self):
+        return [dim for i, dim in enumerate(self.curr_dim) if i not in [0, self.c_axis]]
+
+    def prev_size(self):
+        return [dim for i, dim in enumerate(self.prev_dim) if i not in [0, self.c_axis]]
+
+    def num_prev_features(self):
+        return functools.reduce(lambda x, y: x+y, self.prev_dim)
+
+    def num_curr_features(self):
+        return functools.reduce(lambda x, y: x*y, self.curr_dim[1:])
+
+
 class DimsTransformer:
     def __init__(self, batch_transform=None, size_transform=None, channels_transform=None, c_axis=C_AXIS):
         self.c_axis = c_axis
@@ -20,15 +51,33 @@ class DimsTransformer:
         self.channels_transform = channels_transform
         self.batch_transform = batch_transform
 
-    def __call__(self, dims):
+    def __call__(self, dims_tracker: DimsTracker):
+        dims = dims_tracker.curr_dim
         channels = dims[self.c_axis] if self.channels_transform is None else self.channels_transform(dims[self.c_axis])
         batch_size = dims[0] if self.batch_transform is None else self.batch_transform(dims[0])
         other_axes = (ax for ax in range(len(dims)) if ax not in [0, self.c_axis])
-        size = dims[other_axes] if self.size_transform is None else self.size_transform(dims[other_axes])
+        other_dims = [dims[ax] for ax in other_axes]
+        size = other_dims if self.size_transform is None else self.size_transform(other_dims)
         if self.c_axis == 1:
-            new_size = [batch_size, channels, size]
+            new_size = [batch_size, channels, *size]
         else:
-            new_size = [batch_size, size, channels]
+            new_size = [batch_size, *size, channels]
+        return new_size
+
+
+class FlattenTransformer(DimsTransformer):
+    def __init__(self, c_axis=C_AXIS):
+        super(FlattenTransformer, self).__init__(batch_transform=None, size_transform=None, channels_transform=None,
+                                                 c_axis=c_axis)
+
+    def __call__(self, dims_tracker: DimsTracker):
+        dims = dims_tracker.curr_dim
+        batch_size = dims[0]
+        other_axes = (ax for ax in range(len(dims)) if ax not in [0, self.c_axis])
+        size = [dims[ax] for ax in other_axes]
+        size_mul = functools.reduce(lambda x, y: x * y, size)
+        features = size_mul * dims[self.c_axis]
+        new_size = [batch_size, features]
         return new_size
 
 
@@ -42,7 +91,7 @@ class Conv2dTransformer(DimsTransformer):
             elif pad == "valid":
                 pad = (0, 0)
 
-            def output_size(in_size: int, ax:int, p=pad):
+            def output_size(in_size: int, ax: int, p=pad):
                 out_size = in_size + 2 * p[ax] - dilation[ax] * (kernel_size[ax] - 1) - 1
                 out_size = out_size / stride[ax]
                 out_size += 1
@@ -69,7 +118,7 @@ class ConvTrans2dTransformer(DimsTransformer):
             elif pad == "valid":
                 pad = (0, 0)
 
-            def output_size(in_size: int, ax:int, p=pad):
+            def output_size(in_size: int, ax: int, p=pad):
                 out_size = (in_size - 1) * stride[ax] - 2 * p[ax] + \
                            dilation[ax] * (kernel_size[ax] - 1) + output_padding[ax] + 1
                 return out_size
@@ -83,47 +132,9 @@ class ConvTrans2dTransformer(DimsTransformer):
                                                      channels_transform=channels_transform, c_axis=C_AXIS)
 
 
-class DimsTracker:
-    def __init__(self, input_dim, c_axis=C_AXIS):
-        self.curr_dim = input_dim
-        self.prev_dim = input_dim
-        self.c_axis = c_axis
-
-    def update_dims(self, transform):
-        self.prev_dim = self.curr_dim
-        self.curr_dim = transform(self.curr_dim)
-
-    def get_dims(self):
-        return self.prev_dim, self.curr_dim
-
-    def curr_dim(self):
-        return self.curr_dim()
-
-    def prev_dim(self):
-        return self.prev_dim
-
-    def prev_channels(self):
-        return self.prev_dim[self.c_axis]
-
-    def curr_channels(self):
-        return self.curr_dim[self.c_axis]
-
-    def curr_size(self):
-        return [dim for i, dim in enumerate(self.curr_dim) if i not in [0, self.c_axis]]
-
-    def prev_size(self):
-        return [dim for i, dim in enumerate(self.prev_dim) if i not in [0, self.c_axis]]
-
-    def num_prev_features(self):
-        return functools.reduce(lambda x, y: x+y, self.prev_dim())
-
-    def num_curr_features(self):
-        return functools.reduce(lambda x, y: x+y, self.curr_dim())
-
-
 def new_conv2d(curr_dims: DimsTracker, filters, kernel_size=(3, 3), stride=(1, 1), padding="same", dilation=(1, 1)):
     transform = Conv2dTransformer(filters, kernel_size=kernel_size, padding=padding, stride=stride)
-    conv = torch.nn.Conv2d(curr_dims.get_channels()[0], filters, kernel_size=kernel_size, stride=stride,
+    conv = torch.nn.Conv2d(curr_dims.curr_channels(), filters, kernel_size=kernel_size, stride=stride,
                            padding=padding, dilation=dilation)
     curr_dims.update_dims(transform)
     return conv, curr_dims
@@ -132,30 +143,30 @@ def new_conv2d(curr_dims: DimsTracker, filters, kernel_size=(3, 3), stride=(1, 1
 def new_conv_trans2d(curr_dims: DimsTracker, filters, kernel_size=(3, 3), stride=(1, 1),
                      padding=(0, 0), dilation=1):
     transform = ConvTrans2dTransformer(filters, kernel_size=kernel_size, padding=padding, stride=stride)
-    conv = torch.nn.ConvTranspose2d(curr_dims.get_channels()[0], filters, kernel_size=kernel_size, stride=stride,
+    conv = torch.nn.ConvTranspose2d(curr_dims.curr_channels(), filters, kernel_size=kernel_size, stride=stride,
                                     padding=padding, dilation=dilation)
     curr_dims.update_dims(transform)
     return conv, curr_dims
 
 
 def new_linear(curr_dims: DimsTracker, units):
-    curr_dims.update_dims(transform=lambda _: [curr_dims.curr_dim()[0], units])
-    linear = torch.nn.Linear(in_features=curr_dims.num_prev_features(), out_features=curr_dims.num_curr_features())
+    linear = torch.nn.Linear(in_features=curr_dims.num_curr_features(), out_features=units)
+    curr_dims = DimsTracker([curr_dims.curr_dim[0], units])
     return linear, curr_dims
 
 
 class EncoderBlock(torch.nn.Module):
-    def __init__(self, input_dim, filters):
+    def __init__(self, input_dim: list, filters):
         super(EncoderBlock, self).__init__()
         dims = DimsTracker(input_dim)
         self.conv1, dims = new_conv2d(dims, filters=filters)
-        self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim()[1:])
+        self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
         self.conv2, dims = new_conv2d(dims, filters=filters)
-        self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim()[1:])
+        self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
         # cat here
         dims.update_dims(transform=DimsTransformer(channels_transform=lambda x: 2 * x))
         self.conv3, dims = new_conv2d(dims, filters=filters, stride=(2, 2), padding=(1, 1))  # output image size halved
-        self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim()[1:])
+        self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
 
         self.out_dims = dims
 
@@ -174,16 +185,16 @@ class EncoderBlock(torch.nn.Module):
 
 
 class GeneratorBlock(torch.nn.Module):
-    def __init__(self, input_dim, filters):
+    def __init__(self, input_dim: list, filters):
         super(GeneratorBlock, self).__init__()
         dims = DimsTracker(input_dim)
         self.conv1, dims = new_conv_trans2d(dims, filters=filters, kernel_size=(3, 3),
                                             stride=(2, 2), padding=(1, 1))  # doubles input size
-        self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim()[1:])
-        self.conv2, dims = new_conv2d(filters=filters)
-        self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim()[1:])
-        self.conv3, dims = new_conv2d(filters=filters)
-        self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim()[1:])
+        self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+        self.conv2, dims = new_conv2d(curr_dims=dims, filters=filters)
+        self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+        self.conv3, dims = new_conv2d(curr_dims=dims, filters=filters)
+        self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
 
         self.out_dims = dims
 
@@ -205,49 +216,6 @@ def to_image_tanh(x):
     return torch.tanh(x) - 1
 
 
-class ShowGeneratorCallback(keras.callbacks.Callback):
-    def __init__(self, display=100):
-        super(ShowGeneratorCallback, self).__init__()
-        self.seen = 0
-        self.display = display
-
-    def print_pics(self):
-        if self.seen % self.display > 0:
-            return
-
-        batch_size = tf.constant(9)
-        code_shape = self.model.code_shape
-        code_features = self.model.code_features
-        noise_features = self.model.noise_features
-
-        latent_shape = (batch_size, code_shape[1], code_shape[2],
-                        code_features + noise_features)
-        random_latent_vectors = tf.random.normal(shape=latent_shape)
-
-        alpha = self.model.current_alpha
-        alpha = tf.constant(alpha, dtype=tf.float32)
-        random_pics = self.model.generator([random_latent_vectors, alpha * tf.ones([batch_size])])
-
-        plt.figure(figsize=(10, 10))
-        for i in range(9):
-            image = random_pics[i]
-            image = tf.image.convert_image_dtype(image, tf.uint8)
-            ax = plt.subplot(3, 3, i + 1)
-            plt.imshow(image.numpy().astype("uint8"))
-            plt.axis("off")
-        plt.show()
-
-    def on_train_batch_end(self, batch, logs={}):
-        tf.py_function(func=self.print_pics, inp=[self.seen, self.display], Tout=[])
-        self.seen += 1
-
-
-class MemoryCallback(tf.keras.callbacks.Callback):
-    def on_train_batch_begin(self, batch, logs={}):
-        if batch % 100 == 0:
-            print(' ', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-
-
 class Generator(torch.nn.Module):
     def __init__(self, batch_size, code_shape, noise_features, image_shape, decoder_filters_list, pixel_features,
                  eval_model):
@@ -255,16 +223,24 @@ class Generator(torch.nn.Module):
         self.image_shape = image_shape
         self.pixel_features = pixel_features
         self.eval_model = eval_model
-        dims = DimsTracker(input_dim=[batch_size, code_shape[1], code_shape[2],
-                                      code_shape[3] + noise_features])
-        units = code_shape[1] * code_shape[2] * (code_shape[3] + noise_features)
+        size = [code_shape[1], code_shape[2]]
+        channels = code_shape[3] + noise_features
+        if C_AXIS == 1:
+            inp_dims = DimsTracker(input_dim=[batch_size, channels, *size])
+        else:
+            inp_dims = DimsTracker(input_dim=[batch_size, *size, channels])
+        dims = copy.copy(inp_dims)
+        dims.update_dims(FlattenTransformer())
+        units = dims.num_curr_features()
         self.linear1, dims = new_linear(dims, units)
         self.generator_blocks = torch.nn.ModuleList()
+        # reshape back to image shape
+        dims = copy.copy(inp_dims)
         current_decoder_layers = []
         for i, f in enumerate(decoder_filters_list):
-            self.generator_blocks.append(GeneratorBlock(dims, f))
+            self.generator_blocks.append(GeneratorBlock(dims.curr_dim, f))
             current_decoder_layers.append(f)
-            dims.update_dims(transform=lambda _: self.generator_blocks[-1].out_dims.curr_dim())
+            dims.update_dims(transform=lambda _: self.generator_blocks[-1].out_dims.curr_dim)
             print(f"Generator: dims={dims.curr_size()}, image shape={self.image_shape}")
             if dims.curr_size() == self.image_shape:
                 break
@@ -279,12 +255,12 @@ class Generator(torch.nn.Module):
 
     def forward(self, inputs):
         if self.eval_model:
-            x = inputs
+            x_inp = inputs
         else:
-            x, alpha = inputs
-        x = torch.reshape(x, shape=[inputs.shape[0], -1])
+            x_inp, alpha = inputs
+        x = torch.reshape(x_inp, shape=[x_inp.shape[0], -1])
         x = self.linear1(x)
-        x = torch.reshape(x, shape=inputs.shape)
+        x = torch.reshape(x, shape=x_inp.shape)
         x = torch.nn.LeakyReLU(negative_slope=0.2)(x)
         for block in self.generator_blocks:
             x_prev = x
@@ -293,7 +269,7 @@ class Generator(torch.nn.Module):
         x = torch.nn.ReLU()(x)
         x = self.to_rgb(x)
         if not self.eval_model:
-            x_prev = torch.nn.UpsamplingNearest2d()(x_prev)
+            x_prev = torch.nn.UpsamplingNearest2d(scale_factor=2)(x_prev)
             x_prev = self.to_rgb(x_prev)
             x_prev = x_prev * (1 - alpha)
             x = x * alpha
@@ -313,15 +289,14 @@ class Encoder(torch.nn.Module):
         f = next(current_encoder_layers)
         # average pooling reduces
         avg_pooling2d_dims = dims
-        avg_pooling2d_dims.update_dims(DimsTransformer(size_transform=lambda x: int(x/2)))
+        avg_pooling2d_dims.update_dims(DimsTransformer(size_transform=lambda x: [int(x[i]//2) for i in range(len(x))]))
         # fade in layers
         self.from_rgb, _ = new_conv2d(avg_pooling2d_dims, f, kernel_size=(1, 1))
-        encoder_blocks = [EncoderBlock(dims.curr_dim(), f)]
-        dims.update_dims(transform=lambda _: self.encoder_block.out_dims)
-
+        encoder_blocks = [EncoderBlock(dims.curr_dim, f)]
+        dims.update_dims(transform=lambda _: encoder_blocks[-1].out_dims.curr_dim)
         for i, f in enumerate(current_encoder_layers):
-            encoder_blocks.append(EncoderBlock(dims.curr_dim(), f))
-            dims.update_dims(transform=lambda _: self.encoder_blocks[-1].out_dims)
+            encoder_blocks.append(EncoderBlock(dims.curr_dim, f))
+            dims.update_dims(transform=lambda _: encoder_blocks[-1].out_dims.curr_dim)
             print(f"Encoder: output shape={dims.curr_size()}")
         # We save the blocks in reverse order, so that when we save the oldest block will have index zero.
         # This way the existing blocks don't change when we add additional ones
@@ -424,16 +399,16 @@ class InfoWGAN:
 
         self.decoder_filters_list = decoder_filters_list
 
-        self.real_label = torch.Tensor(-1, dtype=torch.float32)
-        self.fake_label = torch.Tensor(1, dtype=torch.float32)
+        self.real_label = torch.tensor(-1, dtype=torch.float32)
+        self.fake_label = torch.tensor(1, dtype=torch.float32)
 
         self.current_alpha = None
 
-        self.d_optimizer = torch.optim.Adam(params={})
-        self.g_optimizer = torch.optim.Adam(params={})
-        self.q_optimizer = torch.optim.Adam(params={})
-        self.grad_lambda = torch.Tensor(info_lambda)
-        self.info_lambda = torch.Tensor(grad_lambda)
+        self.d_optimizer = None
+        self.g_optimizer = None
+        self.q_optimizer = None
+        self.grad_lambda = torch.tensor(info_lambda)
+        self.info_lambda = torch.tensor(grad_lambda)
         self.generator = torch.nn.Module()
         self.coder = torch.nn.Module()
         self.coderHead = torch.nn.Module()
@@ -462,8 +437,8 @@ class InfoWGAN:
         files = glob.glob(files_dir)
         image_count = len(files)
         # train/test split
-        train_perc = 0.8
-        train_samples = int(round(image_count * train_perc))
+        train_percent = 0.8
+        train_samples = int(round(image_count * train_percent))
         train_files = files[:train_samples]
         val_files = files[train_samples:]
         train_dataset = FacesDataset(train_files)
@@ -471,18 +446,18 @@ class InfoWGAN:
         return train_dataset, val_dataset
 
     def fit(self):
-        '''
+        """
         Custom training loop.
         load models as needed.
         Adjust image inputs to correct resolution
-        '''
-
-        # 1 image batch at 128x128... 256 images at 4x4
-        self.batch_size = int(max(1,
-                                  int(0.25 * 128 * 128 / (self.image_shape[0] * self.image_shape[1]))))
+        :return:
+        """
         while True:
             # build models
             self.load_image_shape()
+            # 1 image batch at 128x128... 256 images at 4x4
+            self.batch_size = int(max(1,
+                                      int(0.25 * 128 * 128 / (self.image_shape[0] * self.image_shape[1]))))
             train_ds, eval_ds = self.get_image_dataset(self.files_dir)
             self.build_models(self.image_shape, eval_model=False)
             self.compile(d_optimizer=torch.optim.Adam(chain(self.criticHead.parameters(),
@@ -495,7 +470,7 @@ class InfoWGAN:
             start_epoch = self.load_cp()
 
             # get datasets of resized images
-            train_loader = DataLoader(train_ds, batch_size=images_per_batch, shuffle=True)
+            train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
             losses = None
             for epoch in range(start_epoch, self.epochs_per_phase):
                 self.current_alpha = (self.curr_epoch % self.epochs_per_phase + 1) / self.epochs_per_phase
@@ -505,7 +480,7 @@ class InfoWGAN:
                     losses = self.train_step(batch)
                     progress_bar.set_description(f"Epoch {epoch}, critic loss {losses['critic_loss']}")
                     if i % 100 == 99:
-                        self.save_sample_pics(eval_ds)
+                        self.save_sample_pics()
                 progress_bar.close()
 
             # checkpoint model
@@ -579,34 +554,34 @@ class InfoWGAN:
         self.d_optimizer = d_optimizer
         self.g_optimizer = g_optimizer
         self.q_optimizer = q_optimizer
-        self.grad_lambda = torch.Tensor(grad_lambda, dtype=torch.float32)
-        self.info_lambda = torch.Tensor(info_lambda, dtype=torch.float32)
+        self.grad_lambda = torch.tensor(grad_lambda, dtype=torch.float32)
+        self.info_lambda = torch.tensor(info_lambda, dtype=torch.float32)
 
-    def test_step(self, data):
-        if isinstance(data, tuple):
-            real_images = data[0]
-        else:
-            real_images = data
+    def test_step(self, images):
 
         # progressive GAN alpha hyperparameter
         with torch.no_grad():
-            current_epoch = torch.Tensor(self.curr_epoch, dtype=torch.float32)
+            current_epoch = torch.tensor(self.curr_epoch, dtype=torch.float32)
             alpha = torch.divide(torch.add(torch.fmod(current_epoch, self.epochs_per_phase), 1), self.epochs_per_phase)
             # Sample random points in the latent space
-            batch_size = tf.shape(real_images)[0]
-            latent_shape = [batch_size, self.code_shape[1], self.code_shape[2],
-                            self.code_features + self.noise_features]
+            batch_size = images.shape[0]
+            size = [self.code_shape[1], self.code_shape[2]]
+            channels = self.code_features + self.noise_features
+            if C_AXIS == 1:
+                latent_shape = [batch_size, channels, *size]
+            else:
+                latent_shape = [batch_size, *size, channels]
             random_latent_vectors = torch.randn(size=latent_shape)
 
             # Decode them to fake images
             generated_images = self.generator([random_latent_vectors, alpha])
 
-            # generate random "intermidiate" images interpolating the generated and real images for gradient penalty
+            # generate random "intermediate" images interpolating the generated and real images for gradient penalty
             eps = torch.rand([batch_size, 1, 1, 1], dtype=torch.float32)
-            interp_images = torch.mul(eps, real_images) + torch.mul((1 - eps), generated_images)
+            interp_images = torch.mul(eps, images) + torch.mul((1 - eps), generated_images)
 
             # Combine them with real images
-            combined_images = torch.cat([generated_images, real_images], dim=0)
+            combined_images = torch.cat([generated_images, images], dim=0)
 
             # Assemble labels discriminating real from fake images
             labels = torch.cat([self.fake_label * torch.ones((batch_size, 1), dtype=torch.float32),
@@ -623,7 +598,6 @@ class InfoWGAN:
             param.requires_grad(False)
         interp_conv = self.coder([interp_images, alpha])
         interp_criticism = self.criticHead(interp_conv)
-        # d_crit/d_img
         for elem in interp_criticism:
             elem.backward()
         critic_x_grad = interp_images.grad
@@ -636,7 +610,7 @@ class InfoWGAN:
         with torch.no_grad():
             critic_x_grad = torch.reshape(critic_x_grad, [batch_size, -1])
             penalty_loss = torch.mean(torch.square(torch.add(torch.norm(critic_x_grad, dim=-1, keepdim=True), -1)))
-            d_loss = wgan_loss + self.grad_lambda * penalty_loss
+            # d_loss = wgan_loss + self.grad_lambda * penalty_loss
 
             # Sample random points in the latent space
             random_latent_vectors = torch.randn(size=latent_shape)
@@ -657,36 +631,39 @@ class InfoWGAN:
             info_loss = tf.reduce_mean(tf.math.squared_difference(code_prediction, random_code))
 
         return {"critic_loss": -wgan_loss, "generator_loss": g_loss,
-                #                 "info_loss": info_loss,
-                "gradient_penalty_loss": penalty_loss}
+                "info_loss": info_loss, "gradient_penalty_loss": penalty_loss}
 
-    def train_step(self, image):
-        curr_epoch = torch.Tensor(self.curr_epoch, dtype=torch.int32)
-        # progressive GAN alpha hyperparameter
+    def train_step(self, images):
+        curr_epoch = torch.tensor(self.curr_epoch, dtype=torch.int32)
+        # progressive GAN alpha hyper parameter
         alpha = torch.divide(torch.add(torch.fmod(curr_epoch, self.epochs_per_phase), 1), self.epochs_per_phase)
         # Sample random points in the latent space
-        batch_size = image.shape
-        latent_shape = (batch_size, self.code_shape[1], self.code_shape[2],
-                        self.code_features + self.noise_features)
+        batch_size = images.shape[0]
+        size = [self.code_shape[1], self.code_shape[2]]
+        channels = self.code_features + self.noise_features
+        if C_AXIS == 1:
+            latent_shape = [batch_size, channels, *size]
+        else:
+            latent_shape = [batch_size, *size, channels]
         random_latent_vectors = torch.randn(size=latent_shape)
 
         # Decode them to fake images
         generated_images = self.generator([random_latent_vectors, alpha])
 
-        # generate random "intermidiate" images interpolating the generated and real images for gradient penalty
+        # generate random "intermediate" images interpolating the generated and real images for gradient penalty
         eps = torch.rand(size=[batch_size, 1, 1, 1])
-        interp_images = torch.mul(eps, image) + torch.mul((1 - eps), generated_images)
+        interp_images = torch.mul(eps, images) + torch.mul((1 - eps), generated_images)
 
         # Combine them with real images
-        combined_images = torch.cat([generated_images, image], dim=0)
+        combined_images = torch.cat([generated_images, images], dim=0)
 
         # Assemble labels discriminating real from fake images
         labels = torch.cat([self.fake_label * torch.ones([batch_size, 1]),
                             self.real_label * torch.ones([batch_size, 1])], dim=0)
 
         # Train the discriminator to optimality
-        wgan_loss = torch.Tensor(0, dtype=torch.float32)
-        penalty_loss = torch.Tensor(0, dtype=torch.float32)
+        wgan_loss = torch.tensor(0, dtype=torch.float32)
+        penalty_loss = torch.tensor(0, dtype=torch.float32)
         for step in range(5):
             conv_out = self.coder([combined_images, alpha])
             criticism = self.criticHead(conv_out)
@@ -724,9 +701,9 @@ class InfoWGAN:
         fake_images = self.generator([random_latent_vectors, alpha])
         conv_out_fake = self.coder([fake_images, alpha])
         fake_criticism = self.criticHead(conv_out_fake)
-        code_pred = self.coderHead(conv_out_fake)
+        code_prediction = self.coderHead(conv_out_fake)
         g_loss = torch.mean(misleading_labels * fake_criticism)
-        info_loss = torch.mean(torch.square(torch.diff(code_pred, random_code)))
+        info_loss = torch.mean(torch.square(torch.diff(code_prediction, random_code)))
         total_g_loss = g_loss + self.info_lambda * info_loss
         total_g_loss.backward()
         self.g_optimizer.step()
@@ -740,7 +717,7 @@ class InfoWGAN:
 
     def save_sample_pics(self):
         with torch.no_grad():
-            current_epoch = torch.Tensor(self.curr_epoch, dtype=torch.float32)
+            current_epoch = torch.tensor(self.curr_epoch, dtype=torch.float32)
             alpha = torch.divide(torch.add(torch.fmod(current_epoch, self.epochs_per_phase), 1), self.epochs_per_phase)
             # Sample random points in the latent space
             batch_size = 9
@@ -751,7 +728,7 @@ class InfoWGAN:
             # Decode them to fake images
             generated_images = self.generator([random_latent_vectors, alpha])
             # make and save figure of images
-            fig = plt.figure(figsize=(10, 10))
+            plt.figure(figsize=(10, 10))
             generated_images = torchvision.transforms.ConvertImageDtype(torch.uint8)(generated_images)
             for i in range(9):
                 plt.subplot(3, 3, i + 1)
