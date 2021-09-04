@@ -89,7 +89,7 @@ if __name__ == "__main__":
     parser.add_argument("--station", dest="station", type=str, choices={"aws", "home"}, default="aws", required=False)
     args = parser.parse_args()
 
-    print(f"running pytorch version {}")
+    print(f"running pytorch version {torch.__version__}")
     subprocess.run(["nvidia-smi", "-L"])
 
     # if args.v == 1:
