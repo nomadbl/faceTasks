@@ -407,8 +407,10 @@ class FacesDataset(Dataset):
 
 
 class InfoWGAN:
-    def __init__(self, files_dir, batch_size, code_features, noise_features, pixel_features,
-                 decoder_filters_list, cp_dir, epochs_per_phase=5, training_file=None):
+    def __init__(self, files_dir, code_features, noise_features, pixel_features,
+                 decoder_filters_list, cp_dir, epochs_per_phase=5, batch_size=None,
+                 info_lambda=100,
+                 grad_lambda=10):
         super(InfoWGAN, self).__init__()
         self.code_shape = [None, 1, 1, code_features]
         self.noise_features = noise_features
@@ -417,7 +419,6 @@ class InfoWGAN:
         self.batch_size = batch_size
 
         self.cp_dir = cp_dir
-        self.training_file = training_file
         self.epochs_per_phase = epochs_per_phase
         self.curr_epoch = 0
 
@@ -431,8 +432,8 @@ class InfoWGAN:
         self.d_optimizer = torch.optim.Adam(params={})
         self.g_optimizer = torch.optim.Adam(params={})
         self.q_optimizer = torch.optim.Adam(params={})
-        self.gradLAMBDA = torch.Tensor(0.1)
-        self.infoLAMBDA = torch.Tensor(0.1)
+        self.grad_lambda = torch.Tensor(info_lambda)
+        self.info_lambda = torch.Tensor(grad_lambda)
         self.generator = torch.nn.Module()
         self.coder = torch.nn.Module()
         self.coderHead = torch.nn.Module()
@@ -469,7 +470,7 @@ class InfoWGAN:
         val_dataset = FacesDataset(val_files)
         return train_dataset, val_dataset
 
-    def fit(self, files_dir):
+    def fit(self):
         '''
         Custom training loop.
         load models as needed.
@@ -477,8 +478,8 @@ class InfoWGAN:
         '''
 
         # 1 image batch at 128x128... 256 images at 4x4
-        images_per_batch = int(max(1,
-                                   int(0.25 * 128 * 128 / (self.image_shape[0] * self.image_shape[1]))))
+        self.batch_size = int(max(1,
+                                  int(0.25 * 128 * 128 / (self.image_shape[0] * self.image_shape[1]))))
         while True:
             # build models
             self.load_image_shape()
@@ -578,8 +579,8 @@ class InfoWGAN:
         self.d_optimizer = d_optimizer
         self.g_optimizer = g_optimizer
         self.q_optimizer = q_optimizer
-        self.gradLAMBDA = torch.Tensor(grad_lambda, dtype=torch.float32)
-        self.infoLAMBDA = torch.Tensor(info_lambda, dtype=torch.float32)
+        self.grad_lambda = torch.Tensor(grad_lambda, dtype=torch.float32)
+        self.info_lambda = torch.Tensor(info_lambda, dtype=torch.float32)
 
     def test_step(self, data):
         if isinstance(data, tuple):
@@ -635,7 +636,7 @@ class InfoWGAN:
         with torch.no_grad():
             critic_x_grad = torch.reshape(critic_x_grad, [batch_size, -1])
             penalty_loss = torch.mean(torch.square(torch.add(torch.norm(critic_x_grad, dim=-1, keepdim=True), -1)))
-            d_loss = wgan_loss + self.gradLAMBDA * penalty_loss
+            d_loss = wgan_loss + self.grad_lambda * penalty_loss
 
             # Sample random points in the latent space
             random_latent_vectors = torch.randn(size=latent_shape)
@@ -702,7 +703,7 @@ class InfoWGAN:
             critic_x_grad = torch.reshape(critic_x_grad, [batch_size, -1])
             penalty_loss = torch.mean(torch.square(torch.add(torch.norm(critic_x_grad, dim=-1, keepdim=True), -1)))
 
-            d_loss = wgan_loss + self.gradLAMBDA * penalty_loss
+            d_loss = wgan_loss + self.grad_lambda * penalty_loss
             d_loss.backward()
             self.d_optimizer.step()
             self.d_optimizer.zero_grad()
@@ -726,7 +727,7 @@ class InfoWGAN:
         code_pred = self.coderHead(conv_out_fake)
         g_loss = torch.mean(misleading_labels * fake_criticism)
         info_loss = torch.mean(torch.square(torch.diff(code_pred, random_code)))
-        total_g_loss = g_loss + self.infoLAMBDA * info_loss
+        total_g_loss = g_loss + self.info_lambda * info_loss
         total_g_loss.backward()
         self.g_optimizer.step()
         self.g_optimizer.zero_grad()
