@@ -107,6 +107,18 @@ class Conv2dTransformer(DimsTransformer):
                                                 c_axis=C_AXIS)
 
 
+class CatTransformer(DimsTransformer):
+    def __init__(self, dims_list: list, cat_dim):
+        new_dim = functools.reduce(lambda x, y: x.curr_dim[cat_dim] + y.curr_dim[cat_dim], dims_list)
+        rest_dim = [dims_list[0].curr_dim[ax] for ax in range(len(dims_list[0].curr_dim)) if ax != cat_dim]
+        self.out_dim = rest_dim
+        self.out_dim.insert(cat_dim, new_dim)
+        super(CatTransformer, self).__init__()
+
+    def __call__(self, dims_tracker: DimsTracker):
+        return self.out_dim
+
+
 class ConvTrans2dTransformer(DimsTransformer):
     def __init__(self, filters, kernel_size, stride,
                  padding=(0, 0), dilation=(1, 1), output_padding=(0, 0)):
@@ -140,11 +152,12 @@ def new_conv2d(curr_dims: DimsTracker, filters, kernel_size=(3, 3), stride=(1, 1
     return conv, curr_dims
 
 
-def new_conv_trans2d(curr_dims: DimsTracker, filters, kernel_size=(3, 3), stride=(1, 1),
-                     padding=(0, 0), dilation=1):
-    transform = ConvTrans2dTransformer(filters, kernel_size=kernel_size, padding=padding, stride=stride)
+def new_conv_trans2d(curr_dims: DimsTracker, filters, kernel_size=(3, 3), stride=(2, 2),
+                     padding=(1, 1), dilation=(1, 1), output_padding=(1, 1)):
+    transform = ConvTrans2dTransformer(filters, kernel_size=kernel_size, padding=padding,
+                                       stride=stride, output_padding=output_padding, dilation=dilation)
     conv = torch.nn.ConvTranspose2d(curr_dims.curr_channels(), filters, kernel_size=kernel_size, stride=stride,
-                                    padding=padding, dilation=dilation)
+                                    padding=padding, dilation=dilation, output_padding=output_padding)
     curr_dims.update_dims(transform)
     return conv, curr_dims
 
@@ -156,31 +169,33 @@ def new_linear(curr_dims: DimsTracker, units):
 
 
 class EncoderBlock(torch.nn.Module):
-    def __init__(self, input_dim: list, filters):
+    def __init__(self, input_dim: list, filters, c_axis=C_AXIS):
         super(EncoderBlock, self).__init__()
         dims = DimsTracker(input_dim)
+        input_dims = copy.copy(dims)
         self.conv1, dims = new_conv2d(dims, filters=filters)
         self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
         self.conv2, dims = new_conv2d(dims, filters=filters)
         self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
         # cat here
-        dims.update_dims(transform=DimsTransformer(channels_transform=lambda x: 2 * x))
+        dims.update_dims(transform=CatTransformer([dims, input_dims], cat_dim=c_axis))
         self.conv3, dims = new_conv2d(dims, filters=filters, stride=(2, 2), padding=(1, 1))  # output image size halved
         self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
 
         self.out_dims = dims
 
     def forward(self, inputs):
+        inputs_cp = torch.clone(inputs)
         x = self.conv1(inputs)  # output_dim_pre_concat
-        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)  # intermediate_dim
-        x = self.ln1(x)  # intermediate_dim
-        x = self.conv2(x)  # intermediate_dim
-        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)  # intermediate_dim
-        x = self.ln2(x)  # intermediate_dim
-        x = torch.cat([x, inputs], dim=C_AXIS)  # skip connection, C_AXIS: filters * 2
-        x = self.conv3(x)  # output_dim
-        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)  # output_dim
-        x = self.ln3(x)  # output_dim
+        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
+        x = self.ln1(x)
+        x = self.conv2(x)
+        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
+        x = self.ln2(x)
+        x = torch.cat([x, inputs_cp], dim=C_AXIS)  # skip connection, C_AXIS: filters * 2
+        x = self.conv3(x)
+        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
+        x = self.ln3(x)
         return x
 
 
@@ -188,8 +203,7 @@ class GeneratorBlock(torch.nn.Module):
     def __init__(self, input_dim: list, filters):
         super(GeneratorBlock, self).__init__()
         dims = DimsTracker(input_dim)
-        self.conv1, dims = new_conv_trans2d(dims, filters=filters, kernel_size=(3, 3),
-                                            stride=(2, 2), padding=(1, 1))  # doubles input size
+        self.conv1, dims = new_conv_trans2d(dims, filters=filters)  # doubles input size
         self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
         self.conv2, dims = new_conv2d(curr_dims=dims, filters=filters)
         self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
@@ -240,6 +254,7 @@ class Generator(torch.nn.Module):
         for i, f in enumerate(decoder_filters_list):
             self.generator_blocks.append(GeneratorBlock(dims.curr_dim, f))
             current_decoder_layers.append(f)
+            dims_prev = copy.copy(dims)
             dims.update_dims(transform=lambda _: self.generator_blocks[-1].out_dims.curr_dim)
             print(f"Generator: dims={dims.curr_size()}, image shape={self.image_shape}")
             if dims.curr_size() == self.image_shape:
@@ -247,13 +262,14 @@ class Generator(torch.nn.Module):
         self.current_decoder_layers = current_decoder_layers
         self.pixel_features_conv, dims = new_conv2d(curr_dims=dims, filters=self.pixel_features, kernel_size=(1, 1))
         self.to_rgb, dims = new_conv2d(curr_dims=dims, filters=3, kernel_size=(1, 1))
+        self.to_rgb_prev, _ = new_conv2d(curr_dims=dims_prev, filters=3, kernel_size=(1, 1))
 
         if eval_model:
             self.eval()
 
         self.out_dims = dims
 
-    def forward(self, inputs):
+    def forward(self, inputs: torch.Tensor):
         if self.eval_model:
             x_inp = inputs
         else:
@@ -263,14 +279,14 @@ class Generator(torch.nn.Module):
         x = torch.reshape(x, shape=x_inp.shape)
         x = torch.nn.LeakyReLU(negative_slope=0.2)(x)
         for block in self.generator_blocks:
-            x_prev = x
+            x_prev = torch.clone(x)
             x = block(x)
         x = self.pixel_features_conv(x)
         x = torch.nn.ReLU()(x)
         x = self.to_rgb(x)
         if not self.eval_model:
             x_prev = torch.nn.UpsamplingNearest2d(scale_factor=2)(x_prev)
-            x_prev = self.to_rgb(x_prev)
+            x_prev = self.to_rgb_prev(x_prev)
             x_prev = x_prev * (1 - alpha)
             x = x * alpha
             x = x + x_prev
@@ -282,14 +298,19 @@ class Encoder(torch.nn.Module):
     def __init__(self, batch_size, image_shape, decoder_filters_list,
                  eval_model):
         super(Encoder, self).__init__()
-        dims = DimsTracker(input_dim=[batch_size, image_shape[0], image_shape[1], 3])
+        size = [image_shape[0], image_shape[1]]
+        channels = 3
+        if C_AXIS == 1:
+            dims = DimsTracker(input_dim=[batch_size, channels, *size])
+        else:
+            dims = DimsTracker(input_dim=[batch_size, *size, channels])
         self.eval_model = eval_model
 
         current_encoder_layers = reversed(decoder_filters_list)
         f = next(current_encoder_layers)
         # average pooling reduces
-        avg_pooling2d_dims = dims
-        avg_pooling2d_dims.update_dims(DimsTransformer(size_transform=lambda x: [int(x[i]//2) for i in range(len(x))]))
+        avg_pooling2d_dims = copy.copy(dims)
+        avg_pooling2d_dims.update_dims(DimsTransformer(size_transform=lambda x: [int(x[el]//2) for el in range(len(x))]))
         # fade in layers
         self.from_rgb, _ = new_conv2d(avg_pooling2d_dims, f, kernel_size=(1, 1))
         encoder_blocks = [EncoderBlock(dims.curr_dim, f)]
@@ -308,14 +329,14 @@ class Encoder(torch.nn.Module):
         self.output_dims = dims
 
     def forward(self, inputs):
-        if not self.eval_model:
+        if self.eval_model:
             x = inputs
         else:
             x, alpha = inputs
-        x_prev = x
+        x_prev = torch.clone(x)
         x = self.encoder_blocks_reverse[-1](x)
         if not self.eval_model:
-            x_prev = torch.nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2), padding=(1, 1))(x_prev)
+            x_prev = torch.nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2), padding=(0, 0))(x_prev)
             x_prev = self.from_rgb(x_prev)
             x_prev = x_prev * (1 - alpha)
             x = x * alpha
@@ -432,8 +453,7 @@ class InfoWGAN:
         self.criticHead = CriticHead(batch_size=self.batch_size, code_shape=self.code_shape,
                                      current_decoder_layers=current_decoder_layers)
 
-    @staticmethod
-    def get_image_dataset(files_dir):
+    def get_image_dataset(self, files_dir):
         files = glob.glob(files_dir)
         image_count = len(files)
         # train/test split
@@ -441,8 +461,8 @@ class InfoWGAN:
         train_samples = int(round(image_count * train_percent))
         train_files = files[:train_samples]
         val_files = files[train_samples:]
-        train_dataset = FacesDataset(train_files)
-        val_dataset = FacesDataset(val_files)
+        train_dataset = FacesDataset(train_files, size=self.image_shape)
+        val_dataset = FacesDataset(val_files, size=self.image_shape)
         return train_dataset, val_dataset
 
     def fit(self):
@@ -648,14 +668,11 @@ class InfoWGAN:
         random_latent_vectors = torch.randn(size=latent_shape)
 
         # Decode them to fake images
-        generated_images = self.generator([random_latent_vectors, alpha])
+        with torch.no_grad():
+            generated_images = self.generator([random_latent_vectors, alpha])
 
-        # generate random "intermediate" images interpolating the generated and real images for gradient penalty
-        eps = torch.rand(size=[batch_size, 1, 1, 1])
-        interp_images = torch.mul(eps, images) + torch.mul((1 - eps), generated_images)
-
-        # Combine them with real images
-        combined_images = torch.cat([generated_images, images], dim=0)
+            # Combine them with real images
+            combined_images = torch.cat([generated_images, images], dim=0)
 
         # Assemble labels discriminating real from fake images
         labels = torch.cat([self.fake_label * torch.ones([batch_size, 1]),
@@ -665,16 +682,20 @@ class InfoWGAN:
         wgan_loss = torch.tensor(0, dtype=torch.float32)
         penalty_loss = torch.tensor(0, dtype=torch.float32)
         for step in range(5):
+            # generate random "intermediate" images interpolating the generated and real images for gradient penalty
+            eps = torch.rand(size=[batch_size, 1, 1, 1])
+            interp_images = torch.mul(eps, images) + torch.mul((1 - eps), generated_images)
+            interp_images.requires_grad = True
+
             conv_out = self.coder([combined_images, alpha])
             criticism = self.criticHead(conv_out)
             wgan_loss = torch.mean(torch.mul(labels, criticism))
 
-            # get grad_x(critic(interpolated_images))
-            interp_images.requires_grad(True)
             conv_out_interp = self.coder([interp_images, alpha])
-            interp_criticism = self.criticHead(conv_out_interp)
-            for elem in interp_criticism:
-                elem.backward()
+            interp_criticism = self.criticHead(conv_out_interp).sum()
+            interp_criticism.backward()
+            # for elem in interp_criticism:
+            #     elem.backward()
             critic_x_grad = interp_images.grad
             interp_images.grad.zero_()
             critic_x_grad = torch.reshape(critic_x_grad, [batch_size, -1])
@@ -699,11 +720,12 @@ class InfoWGAN:
         # Train the generator and encoder(note that we should *not* update the weights
         # of the critic or encoder)!
         fake_images = self.generator([random_latent_vectors, alpha])
-        conv_out_fake = self.coder([fake_images, alpha])
-        fake_criticism = self.criticHead(conv_out_fake)
+        with torch.no_grad():
+            conv_out_fake = self.coder([fake_images, alpha])
+            fake_criticism = self.criticHead(conv_out_fake)
         code_prediction = self.coderHead(conv_out_fake)
         g_loss = torch.mean(misleading_labels * fake_criticism)
-        info_loss = torch.mean(torch.square(torch.diff(code_prediction, random_code)))
+        info_loss = torch.mean(torch.square(code_prediction - random_code))
         total_g_loss = g_loss + self.info_lambda * info_loss
         total_g_loss.backward()
         self.g_optimizer.step()
