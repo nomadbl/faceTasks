@@ -693,20 +693,18 @@ class InfoWGAN:
 
             conv_out_interp = self.coder([interp_images, alpha])
             interp_criticism = self.criticHead(conv_out_interp).sum()
-            interp_criticism.backward()
-            # for elem in interp_criticism:
-            #     elem.backward()
-            critic_x_grad = interp_images.grad
-            interp_images.grad.zero_()
-            critic_x_grad = torch.reshape(critic_x_grad, [batch_size, -1])
+            critic_x_grad = torch.autograd.grad(interp_criticism, interp_images, create_graph=True)
+            critic_x_grad = torch.reshape(critic_x_grad[0], [batch_size, -1])
             penalty_loss = torch.mean(torch.square(torch.add(torch.norm(critic_x_grad, dim=-1, keepdim=True), -1)))
 
-            d_loss = wgan_loss + self.grad_lambda * penalty_loss
+            d_loss = self.grad_lambda * penalty_loss  # + wgan_loss
             d_loss.backward()
             self.d_optimizer.step()
             self.d_optimizer.zero_grad()
             self.d_optimizer.step()
             self.d_optimizer.zero_grad()
+            interp_images.grad.zero_()
+            critic_x_grad.zero_()
 
         # Sample random points in the latent space
         random_latent_vectors = torch.randn(size=latent_shape)

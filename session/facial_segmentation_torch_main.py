@@ -77,7 +77,7 @@ def main_gan(station):
                    pixel_features=8,
                    decoder_filters_list=[64, 64, 32, 32, 16, 16, 8],
                    cp_dir=cp_dir,
-                   epochs_per_phase=1,
+                   epochs_per_phase=5,
                    info_lambda=100,
                    grad_lambda=10)
     gan.fit()
