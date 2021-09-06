@@ -6,6 +6,7 @@ from itertools import chain
 from unet_segmentor_lib import *
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import functools
 
@@ -415,6 +416,12 @@ class InfoWGAN:
         self.batch_size = batch_size
 
         self.cp_dir = cp_dir
+        run_id = 0
+        # get unique folder
+        while os.path.exists(os.path.join(cp_dir, f"summaries_{run_id}")):
+            run_id += 1
+        self.tensorboard_writer = SummaryWriter(os.path.join(cp_dir, f"summaries_{run_id}"))
+
         self.epochs_per_phase = epochs_per_phase
         self.curr_epoch = 0
 
@@ -492,15 +499,25 @@ class InfoWGAN:
             # get datasets of resized images
             train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
             losses = None
+            running_loss = 0.0
+            n_total_steps = len(train_loader)
             for epoch in range(start_epoch, self.epochs_per_phase):
                 self.current_alpha = (self.curr_epoch % self.epochs_per_phase + 1) / self.epochs_per_phase
                 train_ds = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
-                progress_bar = tqdm(enumerate(train_loader))
-                for i, batch in progress_bar:
+                progress_bar = tqdm(train_loader)
+                i = 0
+                for batch in progress_bar:
                     losses = self.train_step(batch)
-                    progress_bar.set_description(f"Epoch {epoch}, critic loss {losses['critic_loss']}")
-                    if i % 100 == 99:
-                        self.save_sample_pics()
+                    running_loss += losses['critic_loss'].item()
+                    progress_bar.set_description(f"Epoch {epoch}, critic loss {losses['critic_loss'].item()}")
+                    if (i + 1) % (n_total_steps // 4) == 0:
+                        self.tensorboard_writer.add_scalar('critic loss', running_loss / 100, epoch * n_total_steps + i)
+                        self.write_tensorboard_summaries(epoch * n_total_steps + i)
+                        running_loss = 0.0
+                    if (i + 1) % (n_total_steps // 2) == 0:
+                        # checkpoint model
+                        self.save_cp(epoch, losses)
+                    i += 1
                 progress_bar.close()
 
             # checkpoint model
@@ -514,12 +531,10 @@ class InfoWGAN:
                 break
             train_ds.update_size(self.image_shape)
 
+        self.tensorboard_writer.close()
+
     def save_cp(self, epoch, losses):
-        cp_dict = {}
-        cp_dict += losses
-        if not os.path.exists(self.cp_dir):
-            os.mkdir(self.cp_dir)
-        torch.save({
+        cp_dict = {
             'epoch': epoch,
             'generator_state_dict': self.generator.state_dict(),
             'coder_state_dict': self.coder.state_dict(),
@@ -529,7 +544,11 @@ class InfoWGAN:
             'd_optimizer_state_dict': self.d_optimizer.state_dict(),
             'g_optimizer_state_dict': self.g_optimizer.state_dict(),
             'image_shape': self.image_shape
-        }, os.path.join(self.cp_dir, "checkpoint.pth"))
+        }
+        cp_dict.update(losses)
+        if not os.path.exists(self.cp_dir):
+            os.mkdir(self.cp_dir)
+        torch.save(cp_dict, os.path.join(self.cp_dir, "checkpoint.pth"))
 
     def load_cp(self, load_optimizer_state=False):
         if os.path.exists(os.path.join(self.cp_dir, "checkpoint.pth")):
@@ -699,6 +718,11 @@ class InfoWGAN:
 
             d_loss = self.grad_lambda * penalty_loss  # + wgan_loss
             d_loss.backward()
+            # d_grads = torch.zeros(1, dtype=torch.float32)
+            # for param in self.coder.parameters():
+            #     d_grads += param.grad.sum()
+            # for param in self.coderHead.parameters():
+            #     d_grads += param.grad.sum()
             self.d_optimizer.step()
             self.d_optimizer.zero_grad()
             self.d_optimizer.step()
@@ -726,6 +750,9 @@ class InfoWGAN:
         info_loss = torch.mean(torch.square(code_prediction - random_code))
         total_g_loss = g_loss + self.info_lambda * info_loss
         total_g_loss.backward()
+        # g_grads = torch.zeros(1, dtype=torch.float32)
+        # for param in self.generator.parameters():
+        #     g_grads += param.grad.sum()
         self.g_optimizer.step()
         self.g_optimizer.zero_grad()
         self.q_optimizer.step()
@@ -735,22 +762,39 @@ class InfoWGAN:
                 #                 "info_loss": info_loss,
                 "gradient_penalty_loss": penalty_loss}
 
-    def save_sample_pics(self):
+    def write_tensorboard_summaries(self, global_step):
         with torch.no_grad():
             current_epoch = torch.tensor(self.curr_epoch, dtype=torch.float32)
             alpha = torch.divide(torch.add(torch.fmod(current_epoch, self.epochs_per_phase), 1), self.epochs_per_phase)
             # Sample random points in the latent space
             batch_size = 9
-            latent_shape = [batch_size, self.code_shape[1], self.code_shape[2],
-                            self.code_features + self.noise_features]
+            size = [self.code_shape[1], self.code_shape[2]]
+            channels = self.code_features + self.noise_features
+            if C_AXIS == 1:
+                latent_shape = [batch_size, channels, *size]
+            else:
+                latent_shape = [batch_size, *size, channels]
             random_latent_vectors = torch.randn(size=latent_shape)
 
             # Decode them to fake images
             generated_images = self.generator([random_latent_vectors, alpha])
             # make and save figure of images
-            plt.figure(figsize=(10, 10))
+            # plt.figure(figsize=(10, 10))
             generated_images = torchvision.transforms.ConvertImageDtype(torch.uint8)(generated_images)
-            for i in range(9):
-                plt.subplot(3, 3, i + 1)
-                plt.imshow(generated_images[i])
-            plt.savefig(os.path.join(self.cp_dir, "sample_pics.png"))
+            img_grid = torchvision.utils.make_grid(generated_images)
+            self.tensorboard_writer.add_image("generated images", img_grid, global_step=global_step)
+            # self.tensorboard_writer.add_graph(self.generator, [random_latent_vectors, alpha])
+            critic_params = torch.tensor([], dtype=torch.float32)
+            for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+                with torch.no_grad():
+                    critic_params = torch.cat([critic_params, torch.flatten(param.detach())])
+            self.tensorboard_writer.add_histogram('critic params', critic_params, global_step=global_step)
+            generator_params = torch.tensor([], dtype=torch.float32)
+            for param in self.generator.parameters():
+                with torch.no_grad():
+                    generator_params = torch.cat([generator_params, torch.flatten(param.detach())])
+            self.tensorboard_writer.add_histogram('generator params', generator_params, global_step=global_step)
+            # for i in range(9):
+            #     plt.subplot(3, 3, i + 1)
+            #     plt.imshow(generated_images[i])
+            # plt.savefig(os.path.join(self.cp_dir, "sample_pics.png"))
