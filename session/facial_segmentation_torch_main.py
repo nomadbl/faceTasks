@@ -1,8 +1,9 @@
+import os
 import subprocess
 import argparse
-from unet_segmentor_lib import *
 from pgan_torch import InfoWGAN
 import torch
+
 
 def main_unet(station):
     # station = "home"
@@ -28,7 +29,6 @@ def main_unet(station):
     skip_connections = [1, 1, 1, 0, 0]
     decoder_filters_list = [32, 32, 32, 64, 128]
     head_filters_list = [3]
-
 
 
 def main_gan(station):
@@ -77,7 +77,7 @@ def main_gan(station):
                    pixel_features=8,
                    decoder_filters_list=[64, 64, 32, 32, 16, 16, 8],
                    cp_dir=cp_dir,
-                   epochs_per_phase=5,
+                   epochs_per_phase=100,
                    info_lambda=100,
                    grad_lambda=10)
     gan.fit()
