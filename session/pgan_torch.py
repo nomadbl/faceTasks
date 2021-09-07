@@ -245,27 +245,41 @@ class Generator(torch.nn.Module):
             inp_dims = DimsTracker(input_dim=[batch_size, channels, *size])
         else:
             inp_dims = DimsTracker(input_dim=[batch_size, *size, channels])
+        print("building generator")
+        print(f"input shape {inp_dims.curr_dim}")
+        print("-------------------")
+        print(f"layer           out_shape")
         dims = copy.copy(inp_dims)
         dims.update_dims(FlattenTransformer())
+        print(f"flatten           {dims.curr_dim}")
         units = dims.num_curr_features()
         self.linear1, dims = new_linear(dims, units)
+        print(f"linear           {dims.curr_dim}")
         self.generator_blocks = torch.nn.ModuleList()
         # reshape back to image shape
         dims = copy.copy(inp_dims)
-        current_decoder_layers = []
+        print(f"reshape           {dims.curr_dim}")
+        current_decoder_layers = [dims.curr_channels()]
         for i, f in enumerate(decoder_filters_list):
             self.generator_blocks.append(GeneratorBlock(dims.curr_dim, f))
-            current_decoder_layers.append(f)
             dims_prev = copy.copy(dims)
             dims.update_dims(transform=lambda _: self.generator_blocks[-1].out_dims.curr_dim)
-            print(f"Generator: dims={dims.curr_size()}, image shape={self.image_shape}")
+            print(f"block_{i}           {dims.curr_dim}")
             if dims.curr_size() == self.image_shape:
                 break
+            current_decoder_layers.append(f)
+
         self.current_decoder_layers = current_decoder_layers
         self.pixel_features_conv, dims = new_conv2d(curr_dims=dims, filters=self.pixel_features, kernel_size=(1, 1))
+        print(f"pixel_features_conv           {dims.curr_dim}")
         self.to_rgb, dims = new_conv2d(curr_dims=dims, filters=3, kernel_size=(1, 1))
-        self.to_rgb_prev, _ = new_conv2d(curr_dims=dims_prev, filters=3, kernel_size=(1, 1))
-
+        print(f"to_rgb           {dims.curr_dim}")
+        # upsample x_prev
+        dims_prev.update_dims(transform=DimsTransformer(size_transform=lambda xs: [x * 2 for x in xs]))
+        print(f"upsample2d           {dims_prev.curr_dim}")
+        self.to_rgb_prev, to_rgb_prev_dims = new_conv2d(curr_dims=dims_prev, filters=3, kernel_size=(1, 1))
+        print(f"to_rgb_prev           {to_rgb_prev_dims.curr_dim}")
+        print("\n")
         if eval_model:
             self.eval()
 
@@ -307,24 +321,35 @@ class Encoder(torch.nn.Module):
         else:
             dims = DimsTracker(input_dim=[batch_size, *size, channels])
         self.eval_model = eval_model
+        print("building encoder")
+        print(f"input shape {dims.curr_dim}")
+        print("-------------------")
+        print(f"layer           out_shape")
 
         current_encoder_layers = reversed(decoder_filters_list)
         f = next(current_encoder_layers)
-        # average pooling reduces
-        avg_pooling2d_dims = copy.copy(dims)
-        avg_pooling2d_dims.update_dims(DimsTransformer(size_transform=lambda x: [int(x[el]//2) for el in range(len(x))]))
         # fade in layers
-        self.from_rgb, _ = new_conv2d(avg_pooling2d_dims, f, kernel_size=(1, 1))
+        dims_prev = copy.copy(dims)
+        self.from_rgb, dims = new_conv2d(dims, f, kernel_size=(1, 1))
+        print(f"from_rgb           {dims.curr_dim}")
+        # average pooling halves size
+        dims_prev.update_dims(
+            DimsTransformer(size_transform=lambda x: [int(x[el] // 2) for el in range(len(x))]))
+        avg_pooling2d_dims = dims_prev
+        print(f"average pooling           {avg_pooling2d_dims.curr_dim}")
         encoder_blocks = [EncoderBlock(dims.curr_dim, f)]
         dims.update_dims(transform=lambda _: encoder_blocks[-1].out_dims.curr_dim)
+        print(f"block_0       {dims.curr_dim}")
         for i, f in enumerate(current_encoder_layers):
             encoder_blocks.append(EncoderBlock(dims.curr_dim, f))
             dims.update_dims(transform=lambda _: encoder_blocks[-1].out_dims.curr_dim)
-            print(f"Encoder: output shape={dims.curr_size()}")
+            print(f"block_{i+1}       {dims.curr_dim}")
+            # print(f"Encoder: output shape={dims.curr_size()}")
         # We save the blocks in reverse order, so that when we save the oldest block will have index zero.
         # This way the existing blocks don't change when we add additional ones
         self.encoder_blocks_reverse = torch.nn.ModuleList(reversed(encoder_blocks))
-
+        # self.encoder_blocks = torch.nn.ModuleList(encoder_blocks)
+        print("\n")
         if eval_model:
             self.eval()
 
@@ -336,15 +361,19 @@ class Encoder(torch.nn.Module):
         else:
             x, alpha = inputs
         x_prev = torch.clone(x)
+        x = self.from_rgb(x)
         x = self.encoder_blocks_reverse[-1](x)
+        # x = self.encoder_blocks[0](x)
         if not self.eval_model:
-            x_prev = torch.nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2), padding=(0, 0))(x_prev)
             x_prev = self.from_rgb(x_prev)
+            x_prev = torch.nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2), padding=(0, 0))(x_prev)
             x_prev = x_prev * (1 - alpha)
             x = x * alpha
             x = x + x_prev
         for i in reversed(range(len(self.encoder_blocks_reverse)-1)):
+        # for i in range(len(self.encoder_blocks) - 1):
             x = self.encoder_blocks_reverse[i](x)
+            # x = self.encoder_blocks[i+1](x)
         return x
 
 
@@ -496,7 +525,9 @@ class InfoWGAN:
         """
         while True:
             # build models
-            self.load_image_shape()
+            finished = self.load_image_shape()
+            if finished:
+                break
             # 1 image batch at 128x128... 256 images at 4x4
             self.batch_size = int(max(1,
                                       int(0.25 * 128 * 128 / (self.image_shape[0] * self.image_shape[1]))))
@@ -514,11 +545,11 @@ class InfoWGAN:
 
             losses = None
             running_loss = 0.0
-            n_total_steps = len(train_ds)
             for epoch in range(start_epoch, self.epochs_per_phase):
                 self.current_alpha = (self.curr_epoch % self.epochs_per_phase + 1) / self.epochs_per_phase
                 # get datasets of resized images
                 train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
+                n_total_steps = len(train_loader)
                 progress_bar = tqdm(train_loader)
                 i = 0
                 for batch in progress_bar:
@@ -530,7 +561,8 @@ class InfoWGAN:
                         self.tensorboard_writer.add_scalar('critic loss', running_loss / 100, epoch * n_total_steps + i)
                         self.write_tensorboard_summaries(epoch * n_total_steps + i)
                         running_loss = 0.0
-                    if (i + 1) % (n_total_steps // 2) == 0:
+                    # save once mid epoch
+                    if (i + 1) % (n_total_steps // 2.1) == 0 and (i + 1) // (n_total_steps // 2.1) == 1:
                         # checkpoint model
                         self.save_cp(epoch, losses)
                     i += 1
@@ -539,17 +571,12 @@ class InfoWGAN:
             # checkpoint model
             self.save_cp(0, losses)
 
-            # update image shape
-            image_shape_prev = self.image_shape
-            self.image_shape = [image_shape_prev[0] * 2, image_shape_prev[0] * 2]
-            if self.image_shape[0] >= 128:
-                print("Reached max image resolution. Done training")
-                break
-            train_ds.update_size(self.image_shape)
-
         self.tensorboard_writer.close()
 
     def save_cp(self, epoch, losses):
+        print("coder variables:")
+        for key in self.coder.state_dict():
+            print(f'{key}: {self.coder.state_dict()[key].shape}')
         cp_dict = {
             'epoch': epoch,
             'generator_state_dict': self.generator.state_dict(),
@@ -574,38 +601,43 @@ class InfoWGAN:
                 # purge fade in layers from checkpoint dict so they are not loaded
                 for outer_key in checkpoint.keys():
                     if type(checkpoint[outer_key]) not in [collections.OrderedDict, dict]:
-                        print(f"not modifying {outer_key}")
-                    #  if outer_key in ['epoch', 'image_shape', 'critic_loss', 'generator_loss', 'gradient_penalty_loss']:
                         continue
                     for key in checkpoint[outer_key].keys():
                         if "rgb" in key:
                             cleaned_checkpoint[outer_key].pop(key)
-                        if "pixel_features_conv" in key:
+                        if "pixel" in key:
                             cleaned_checkpoint[outer_key].pop(key)
-                    print(f"modified {outer_key}: {cleaned_checkpoint[outer_key].keys()}")
 
-            self.generator.load_state_dict(checkpoint['generator_state_dict'], strict=False)
-            self.coder.load_state_dict(checkpoint['coder_state_dict'], strict=False)
-            self.criticHead.load_state_dict(checkpoint['critic_head_state_dict'], strict=False)
-            self.coderHead.load_state_dict(checkpoint['coder_head_state_dict'], strict=False)
-            self.image_shape = checkpoint['image_shape']
+            self.generator.load_state_dict(cleaned_checkpoint['generator_state_dict'], strict=False)
+            self.coder.load_state_dict(cleaned_checkpoint['coder_state_dict'], strict=False)
+            self.criticHead.load_state_dict(cleaned_checkpoint['critic_head_state_dict'], strict=False)
+            self.coderHead.load_state_dict(cleaned_checkpoint['coder_head_state_dict'], strict=False)
+            self.image_shape = cleaned_checkpoint['image_shape']
             if load_optimizer_state:
-                self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
-                self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state_dict'])
-                self.q_optimizer.load_state_dict(checkpoint['q_optimizer_state_dict'])
-            return checkpoint['epoch']
+                self.g_optimizer.load_state_dict(cleaned_checkpoint['g_optimizer_state_dict'])
+                self.d_optimizer.load_state_dict(cleaned_checkpoint['d_optimizer_state_dict'])
+                self.q_optimizer.load_state_dict(cleaned_checkpoint['q_optimizer_state_dict'])
+            return cleaned_checkpoint['epoch']
         else:
             print("checkpoint file not found. Starting training from scratch")
             return 0  # start epoch = 0
 
     def load_image_shape(self):
+        """
+        update image shape from checkpoint or use default if no checkpoint exists
+        :return: return True if training is done
+        """
         if os.path.exists(os.path.join(self.cp_dir, "checkpoint.pth")):
             checkpoint = torch.load(os.path.join(self.cp_dir, "checkpoint.pth"))
-            self.image_shape = checkpoint['image_shape']
+            self.image_shape = [checkpoint['image_shape'][0] * 2, checkpoint['image_shape'][0] * 2]
+            if self.image_shape[0] >= 128:
+                print("Reached max image resolution. Done training")
+                return True
             print(f"Found checkpoint. Starting image shape={self.image_shape}")
         else:
             self.image_shape = [4, 4]
             print(f"Checkpoint file not found. Starting image shape={self.image_shape}")
+            return False
 
     def compile(self, d_optimizer: torch.optim.Optimizer,
                 g_optimizer: torch.optim.Optimizer,
