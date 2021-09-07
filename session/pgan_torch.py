@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import functools
+import collections
 
 C_AXIS = 1
 
@@ -568,14 +569,20 @@ class InfoWGAN:
     def load_cp(self, load_optimizer_state=False):
         if os.path.exists(os.path.join(self.cp_dir, "checkpoint.pth")):
             checkpoint = torch.load(os.path.join(self.cp_dir, "checkpoint.pth"))
+            cleaned_checkpoint = copy.deepcopy(checkpoint)
             if checkpoint['epoch'] == 0:
                 # purge fade in layers from checkpoint dict so they are not loaded
                 for outer_key in checkpoint.keys():
+                    if type(checkpoint[outer_key]) not in [collections.OrderedDict, dict]:
+                        print(f"not modifying {outer_key}")
+                    #  if outer_key in ['epoch', 'image_shape', 'critic_loss', 'generator_loss', 'gradient_penalty_loss']:
+                        continue
                     for key in checkpoint[outer_key].keys():
                         if "rgb" in key:
-                            checkpoint[outer_key].pop(key)
+                            cleaned_checkpoint[outer_key].pop(key)
                         if "pixel_features_conv" in key:
-                            checkpoint[outer_key].pop(key)
+                            cleaned_checkpoint[outer_key].pop(key)
+                    print(f"modified {outer_key}: {cleaned_checkpoint[outer_key].keys()}")
 
             self.generator.load_state_dict(checkpoint['generator_state_dict'], strict=False)
             self.coder.load_state_dict(checkpoint['coder_state_dict'], strict=False)
@@ -682,7 +689,7 @@ class InfoWGAN:
             criticism = self.criticHead(conv)
             code_prediction = self.coderHead(conv)
             g_loss = torch.mean(misleading_labels * criticism)
-            info_loss = tf.reduce_mean(tf.math.squared_difference(code_prediction, random_code))
+            info_loss = torch.mean(torch.square(code_prediction - random_code))
 
         return {"critic_loss": -wgan_loss, "generator_loss": g_loss,
                 "info_loss": info_loss  # "gradient_penalty_loss": penalty_loss
