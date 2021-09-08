@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from itertools import chain
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
@@ -437,7 +438,8 @@ class InfoWGAN:
     def __init__(self, files_dir, code_features, noise_features, pixel_features,
                  decoder_filters_list, cp_dir, epochs_per_phase=5, batch_size=None,
                  info_lambda=100,
-                 grad_lambda=10):
+                 grad_lambda=10,
+                 new_run=False):
         super(InfoWGAN, self).__init__()
         self.code_shape = [None, 1, 1, code_features]
         self.noise_features = noise_features
@@ -446,11 +448,12 @@ class InfoWGAN:
         self.batch_size = batch_size
 
         self.cp_dir = cp_dir
-        run_id = 0
         # get unique folder
-        while os.path.exists(os.path.join(cp_dir, f"summaries_{run_id}")):
-            run_id += 1
-        self.tensorboard_writer = SummaryWriter(os.path.join(cp_dir, f"summaries_{run_id}"))
+        if os.path.exists(cp_dir):
+            self.tensorboard_writer = SummaryWriter(os.path.join(cp_dir, "summaries"))
+        else:
+            os.mkdir(cp_dir)
+            self.tensorboard_writer = SummaryWriter(os.path.join(cp_dir, "summaries"))
 
         self.epochs_per_phase = epochs_per_phase
         self.curr_epoch = 0
@@ -523,6 +526,7 @@ class InfoWGAN:
         Adjust image inputs to correct resolution
         :return:
         """
+        test_steps = 5
         while True:
             # build models
             finished = self.load_image_shape()
@@ -531,20 +535,22 @@ class InfoWGAN:
             # 1 image batch at 128x128... 256 images at 4x4
             self.batch_size = int(max(1,
                                       int(0.25 * 128 * 128 / (self.image_shape[0] * self.image_shape[1]))))
+            lr = 0.07 / self.batch_size
+            print(f"learning rate = {lr}")
             train_ds, eval_ds = self.get_image_dataset(self.files_dir)
             self.build_models(self.image_shape, eval_model=False)
             self.compile(d_optimizer=torch.optim.Adam(chain(self.criticHead.parameters(),
                                                             self.coder.parameters()),
-                                                      lr=0.001),
-                         g_optimizer=torch.optim.Adam(self.generator.parameters(), lr=0.001),
-                         q_optimizer=torch.optim.Adam(self.coderHead.parameters(), lr=0.001),
+                                                      lr=lr),
+                         g_optimizer=torch.optim.Adam(self.generator.parameters(), lr=lr),
+                         q_optimizer=torch.optim.Adam(self.coderHead.parameters(), lr=lr),
                          grad_lambda=0.001, info_lambda=0.001)
             # load checkpoint
             start_epoch = self.load_cp()
             self.models_to_device()
 
             losses = None
-            running_loss = 0.0
+            running = {}
             for epoch in range(start_epoch, self.epochs_per_phase):
                 self.current_alpha = (self.curr_epoch % self.epochs_per_phase + 1) / self.epochs_per_phase
                 # get datasets of resized images
@@ -554,15 +560,43 @@ class InfoWGAN:
                 i = 0
                 for batch in progress_bar:
                     batch = batch.to(self.device)
-                    losses = self.train_step(batch)
-                    running_loss += losses['critic_loss'].item()
-                    progress_bar.set_description(f"Epoch {epoch}, critic loss {losses['critic_loss'].item()}")
+                    losses, metrics = self.train_step(batch)
+                    description = f"Epoch {epoch}; "
+                    global_step = epoch * n_total_steps + i
+                    for scalar, value in chain(iter(losses.items()), iter(metrics.items())):
+                        if scalar not in running.keys():
+                            running[scalar] = 0.0
+                        running[scalar] += value.item()
+                        description += f"{scalar} {value.item():.3f}; "
+                    progress_bar.set_description(description)
                     if (i + 1) % (n_total_steps // 4) == 0:
-                        self.tensorboard_writer.add_scalar('critic loss', running_loss / 100, epoch * n_total_steps + i)
-                        self.write_tensorboard_summaries(epoch * n_total_steps + i)
-                        running_loss = 0.0
+                        for scalar, value in running.items():
+                            self.tensorboard_writer.add_scalars(scalar,
+                                                                {"train": value / (n_total_steps // 4)}, global_step)
+                        self.write_tensorboard_summaries(global_step)
+                        for scalar in running:
+                            running[scalar] = 0.0
                     # save once mid epoch
                     if (i + 1) % (n_total_steps // 2.1) == 0 and (i + 1) // (n_total_steps // 2.1) == 1:
+                        # test model and print scalars
+                        eval_running = {}
+                        eval_loader = DataLoader(eval_ds, batch_size=self.batch_size, shuffle=True)
+                        it = iter(eval_loader)
+                        for step in range(test_steps):
+                            images = next(it)
+                            eval_losses, eval_metrics = self.test_step(images)
+                            for scalar, value in chain(iter(eval_losses.items()), iter(eval_metrics.items())):
+                                if scalar not in eval_running.keys():
+                                    eval_running[scalar] = 0.0
+                                eval_running[scalar] += value.item()
+                        description = f"Epoch {epoch}, TEST: "
+                        for scalar, value in eval_running.items():
+                            description += f"{scalar} {value / test_steps:.3f}; "
+                            self.tensorboard_writer.add_scalars(scalar,
+                                                                {"test": value / test_steps}, global_step)
+                        progress_bar.set_description(description)
+                        for scalar in running:
+                            eval_running[scalar] = 0.0
                         # checkpoint model
                         self.save_cp(epoch, losses)
                     i += 1
@@ -574,9 +608,6 @@ class InfoWGAN:
         self.tensorboard_writer.close()
 
     def save_cp(self, epoch, losses):
-        print("coder variables:")
-        for key in self.coder.state_dict():
-            print(f'{key}: {self.coder.state_dict()[key].shape}')
         cp_dict = {
             'epoch': epoch,
             'generator_state_dict': self.generator.state_dict(),
@@ -669,10 +700,24 @@ class InfoWGAN:
             # Decode them to fake images
             generated_images = self.generator([random_latent_vectors, alpha])
 
-            # generate random "intermediate" images interpolating the generated and real images for gradient penalty
+            # gradient penalty
             eps = torch.rand([batch_size, 1, 1, 1], dtype=torch.float32, device=self.device)
             interp_images = torch.mul(eps, images) + torch.mul((1 - eps), generated_images)
 
+        interp_images.requires_grad = True
+
+        for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+            param.requires_grad = False
+        conv_out_interp = self.coder([interp_images, alpha])
+        interp_criticism = self.criticHead(conv_out_interp).sum()
+        critic_x_grad = torch.autograd.grad(interp_criticism, interp_images, create_graph=True)
+        critic_x_grad = torch.reshape(critic_x_grad[0], [batch_size, -1])
+        penalty_loss = torch.mean(torch.square(torch.add(torch.norm(critic_x_grad, dim=-1, keepdim=True), -1)))
+
+        for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+            param.requires_grad = True
+
+        with torch.no_grad():
             # Combine them with real images
             combined_images = torch.cat([generated_images, images], dim=0)
 
@@ -683,49 +728,32 @@ class InfoWGAN:
             conv_out = self.coder([combined_images, alpha])
             criticism = self.criticHead(conv_out)
             wgan_loss = torch.mean(labels * criticism)
-        # # get grad_x(critic(interpolated_images))
-        # interp_images.requires_grad(True)
-        # for param in self.coder.parameters():
-        #     param.requires_grad(False)
-        # for param in self.criticHead.parameters():
-        #     param.requires_grad(False)
-        # interp_conv = self.coder([interp_images, alpha])
-        # interp_criticism = self.criticHead(interp_conv)
-        # for elem in interp_criticism:
-        #     elem.backward()
-        # critic_x_grad = interp_images.grad
-        # interp_images.grad.zero_()
-        # for param in self.coder.parameters():
-        #     param.requires_grad(True)
-        # for param in self.criticHead.parameters():
-        #     param.requires_grad(True)
-
-        with torch.no_grad():
-            # critic_x_grad = torch.reshape(critic_x_grad, [batch_size, -1])
-            # penalty_loss = torch.mean(torch.square(torch.add(torch.norm(critic_x_grad, dim=-1, keepdim=True), -1)))
-            # d_loss = wgan_loss + self.grad_lambda * penalty_loss
 
             # Sample random points in the latent space
             random_latent_vectors = torch.randn(size=latent_shape)
             random_code = random_latent_vectors[:, :, :, :self.code_features]
-
-            # Assemble labels that say "all real images"
-            # This makes the generator want to create real images (match the label) since
-            # we do not include an additional minus in the loss
-            misleading_labels = self.real_label * torch.ones([batch_size, 1, 1, 1])
-
-            # Train the generator and encoder(note that we should *not* update the weights
-            # of the critic or encoder)!
             fake_images = self.generator([random_latent_vectors, alpha])
             conv = self.coder([fake_images, alpha])
-            criticism = self.criticHead(conv)
             code_prediction = self.coderHead(conv)
-            g_loss = torch.mean(misleading_labels * criticism)
             info_loss = torch.mean(torch.square(code_prediction - random_code))
 
-        return {"critic_loss": -wgan_loss, "generator_loss": g_loss,
-                "info_loss": info_loss  # "gradient_penalty_loss": penalty_loss
-                }
+            real_criticism_mean = torch.mean(criticism[batch_size:])
+            fake_criticism_mean = torch.mean(criticism[:batch_size])
+            real_criticism_std = torch.std(criticism[batch_size:])
+            fake_criticism_std = torch.std(criticism[:batch_size])
+            sigmoid = torch.sigmoid(criticism)
+            # if torch.greater(self.real_label, self.fake_label).item():
+            #     predictions = (sigmoid < 0.5).float() # sigmoid will be 0 for real 100%, so pred will be 1 here
+            # else:
+            #     predictions = (sigmoid < 0.5).float() # sigmoid will be 1 for real 100%, so pred will be 0 here
+            predictions = (sigmoid < 0.5).float()
+            critic_accuracy = (predictions == (labels / 2 + 0.5)).float().sum() / (2 * batch_size)
+
+            losses = {"critic_loss": -wgan_loss, "info_loss": info_loss, "gradient_penalty_loss": penalty_loss}
+            metrics = {"critic_accuracy": critic_accuracy, "real_criticism_mean": real_criticism_mean,
+                       "fake_criticism_mean": fake_criticism_mean, "real_criticism_std": real_criticism_std,
+                       "fake_criticism_std": fake_criticism_std}
+        return losses, metrics
 
     def train_step(self, images):
         curr_epoch = torch.tensor(self.curr_epoch, dtype=torch.int32, device=self.device)
@@ -771,19 +799,25 @@ class InfoWGAN:
             critic_x_grad = torch.reshape(critic_x_grad[0], [batch_size, -1])
             penalty_loss = torch.mean(torch.square(torch.add(torch.norm(critic_x_grad, dim=-1, keepdim=True), -1)))
 
-            d_loss = self.grad_lambda * penalty_loss  # + wgan_loss
+            d_loss = self.grad_lambda * penalty_loss + wgan_loss
             d_loss.backward()
-            # d_grads = torch.zeros(1, dtype=torch.float32)
-            # for param in self.coder.parameters():
-            #     d_grads += param.grad.sum()
-            # for param in self.coderHead.parameters():
-            #     d_grads += param.grad.sum()
             self.d_optimizer.step()
             self.d_optimizer.zero_grad()
-            self.d_optimizer.step()
-            self.d_optimizer.zero_grad()
+
             interp_images.grad.zero_()
             critic_x_grad.zero_()
+        with torch.no_grad():
+            real_criticism_mean = torch.mean(criticism[batch_size:])
+            fake_criticism_mean = torch.mean(criticism[:batch_size])
+            real_criticism_std = torch.std(criticism[batch_size:])
+            fake_criticism_std = torch.std(criticism[:batch_size])
+            sigmoid = torch.sigmoid(criticism)
+            # if torch.greater(self.real_label, self.fake_label).item():
+            #     predictions = (sigmoid < 0.5).float() # sigmoid will be 0 for real 100%, so pred will be 1 here
+            # else:
+            #     predictions = (sigmoid < 0.5).float() # sigmoid will be 1 for real 100%, so pred will be 0 here
+            predictions = (sigmoid < 0.5).float()
+            critic_accuracy = (predictions == (labels / 2 + 0.5)).float().sum() / (2 * batch_size)
 
         # Sample random points in the latent space
         random_latent_vectors = torch.randn(size=latent_shape, device=self.device)
@@ -797,9 +831,12 @@ class InfoWGAN:
         # Train the generator and encoder(note that we should *not* update the weights
         # of the critic or encoder)!
         fake_images = self.generator([random_latent_vectors, alpha])
-        with torch.no_grad():
-            conv_out_fake = self.coder([fake_images, alpha])
-            fake_criticism = self.criticHead(conv_out_fake)
+        for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+            param.requires_grad = False
+        conv_out_fake = self.coder([fake_images, alpha])
+        fake_criticism = self.criticHead(conv_out_fake)
+        for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+            param.requires_grad = True
         code_prediction = self.coderHead(conv_out_fake)
         g_loss = torch.mean(misleading_labels * fake_criticism)
         info_loss = torch.mean(torch.square(code_prediction - random_code))
@@ -807,13 +844,17 @@ class InfoWGAN:
         total_g_loss.backward()
 
         self.g_optimizer.step()
-        self.g_optimizer.zero_grad()
         self.q_optimizer.step()
+        self.g_optimizer.zero_grad()
         self.q_optimizer.zero_grad()
 
-        return {"critic_loss": -wgan_loss, "generator_loss": g_loss,
-                #                 "info_loss": info_loss,
-                "gradient_penalty_loss": penalty_loss}
+        losses = {"critic_loss": -wgan_loss,
+                  "info_loss": info_loss,
+                  "gradient_penalty_loss": penalty_loss}
+        metrics = {"critic_accuracy": critic_accuracy, "real_criticism_mean": real_criticism_mean,
+                   "fake_criticism_mean": fake_criticism_mean, "real_criticism_std": real_criticism_std,
+                   "fake_criticism_std": fake_criticism_std}
+        return losses, metrics
 
     def write_tensorboard_summaries(self, global_step):
         with torch.no_grad():
@@ -832,11 +873,9 @@ class InfoWGAN:
             # Decode them to fake images
             generated_images = self.generator([random_latent_vectors, alpha])
             # make and save figure of images
-            # plt.figure(figsize=(10, 10))
             generated_images = torchvision.transforms.ConvertImageDtype(torch.uint8)(generated_images)
             img_grid = torchvision.utils.make_grid(generated_images)
             self.tensorboard_writer.add_image("generated images", img_grid, global_step=global_step)
-            # self.tensorboard_writer.add_graph(self.generator, [random_latent_vectors, alpha])
             critic_params = torch.tensor([], dtype=torch.float32, device=self.device)
             for param in chain(self.coder.parameters(), self.criticHead.parameters()):
                 with torch.no_grad():
@@ -849,7 +888,3 @@ class InfoWGAN:
                     generator_params = torch.cat([generator_params, torch.flatten(param.detach())])
             generator_params = generator_params.to(device=torch.device('cpu'))
             self.tensorboard_writer.add_histogram('generator params', generator_params, global_step=global_step)
-            # for i in range(9):
-            #     plt.subplot(3, 3, i + 1)
-            #     plt.imshow(generated_images[i])
-            # plt.savefig(os.path.join(self.cp_dir, "sample_pics.png"))

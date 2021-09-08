@@ -31,7 +31,7 @@ def main_unet(station):
     head_filters_list = [3]
 
 
-def main_gan(station):
+def main_gan(station, new_run=True, cp_dir=None):
     """
     Attempt #2
     We will use a GAN architecture similar to infoGAN: https://arxiv.org/pdf/1606.03657.pdf
@@ -57,6 +57,7 @@ def main_gan(station):
     Since each pixel has N components in the code, we need each component to be a gaussian of variance 1/sqrt(N)
     (this way the total variance is 1).
     :param station: {"aws", "home"}. run locally or on cloud
+    :param new_run
     :return:
     """
 
@@ -68,7 +69,15 @@ def main_gan(station):
 
     print("current working directory:", home)
     files_dir = f'{home}/images/*.jpg'
-    cp_dir = f'{home}/session/pt_checkpoint/'
+    i = 0
+    if new_run:
+        while os.path.exists(f'{home}/session/run_{i+1}/'):
+            i += 1
+        os.mkdir(f'{home}/session/run_{i+1}/')
+        cp_dir = f'{home}/session/run_{i + 1}/'
+    else:
+        if not os.path.exists(cp_dir):
+            raise ValueError("Checkpoint dir does not exist")
     latent_features = 215
     code_features = 16
     noise_features = latent_features - code_features
@@ -87,6 +96,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--v", dest="v", type=int, choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan")
     parser.add_argument("--station", dest="station", type=str, choices={"aws", "home"}, default="aws", required=False)
+    parser.add_argument("--new_run", dest="new_run", action='store_true', default=False, required=False)
+    parser.add_argument("--checkpoint", "--c", dest="cp_dir", type=str, required=False)
     args = parser.parse_args()
 
     print(f"running pytorch version {torch.__version__}")
@@ -97,4 +108,4 @@ if __name__ == "__main__":
     #     main_unet(args.station)
 
     if args.v == 2:
-        main_gan(args.station)
+        main_gan(args.station, new_run=args.new_run, cp_dir=args.cp_dir)
