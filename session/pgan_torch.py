@@ -584,6 +584,7 @@ class InfoWGAN:
                         it = iter(eval_loader)
                         for step in range(test_steps):
                             images = next(it)
+                            images = images.to(self.device)
                             eval_losses, eval_metrics = self.test_step(images)
                             for scalar, value in chain(iter(eval_losses.items()), iter(eval_metrics.items())):
                                 if scalar not in eval_running.keys():
@@ -722,15 +723,16 @@ class InfoWGAN:
             combined_images = torch.cat([generated_images, images], dim=0)
 
             # Assemble labels discriminating real from fake images
-            labels = torch.cat([self.fake_label * torch.ones((batch_size, 1), dtype=torch.float32),
-                                self.real_label * torch.ones((batch_size, 1), dtype=torch.float32)], dim=0)
+            labels = torch.cat([self.fake_label * torch.ones((batch_size, 1), dtype=torch.float32, device=self.device),
+                                self.real_label * torch.ones((batch_size, 1), dtype=torch.float32, device=self.device)],
+                               dim=0)
 
             conv_out = self.coder([combined_images, alpha])
             criticism = self.criticHead(conv_out)
             wgan_loss = torch.mean(labels * criticism)
 
             # Sample random points in the latent space
-            random_latent_vectors = torch.randn(size=latent_shape)
+            random_latent_vectors = torch.randn(size=latent_shape, device=self.device)
             random_code = random_latent_vectors[:, :, :, :self.code_features]
             fake_images = self.generator([random_latent_vectors, alpha])
             conv = self.coder([fake_images, alpha])
