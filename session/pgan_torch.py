@@ -260,17 +260,20 @@ class Generator(torch.nn.Module):
         # reshape back to image shape
         dims = copy.copy(inp_dims)
         print(f"reshape           {dims.curr_dim}")
-        current_decoder_layers = [dims.curr_channels()]
-        for i, f in enumerate(decoder_filters_list):
+        current_decoder_inputs = []
+        decoder_filters_iter = iter(decoder_filters_list)
+        for i, f in enumerate(decoder_filters_iter):
             self.generator_blocks.append(GeneratorBlock(dims.curr_dim, f))
             dims_prev = copy.copy(dims)
             dims.update_dims(transform=lambda _: self.generator_blocks[-1].out_dims.curr_dim)
             print(f"block_{i}           {dims.curr_dim}")
+            current_decoder_inputs.append(dims.prev_channels())
             if dims.curr_size() == self.image_shape:
                 break
-            current_decoder_layers.append(f)
 
-        self.current_decoder_layers = current_decoder_layers
+        self.from_rgb_channels = dims.curr_channels()  # output channels of first encoder block
+        self.current_decoder_inputs = current_decoder_inputs
+
         self.pixel_features_conv, dims = new_conv2d(curr_dims=dims, filters=self.pixel_features, kernel_size=(1, 1))
         print(f"pixel_features_conv           {dims.curr_dim}")
         self.to_rgb, dims = new_conv2d(curr_dims=dims, filters=3, kernel_size=(1, 1))
@@ -312,7 +315,7 @@ class Generator(torch.nn.Module):
 
 
 class Encoder(torch.nn.Module):
-    def __init__(self, batch_size, image_shape, decoder_filters_list,
+    def __init__(self, batch_size, image_shape, current_decoder_inputs, from_rgb_channels,
                  eval_model):
         super(Encoder, self).__init__()
         size = [image_shape[0], image_shape[1]]
@@ -325,14 +328,16 @@ class Encoder(torch.nn.Module):
         print("building encoder")
         print(f"input shape {dims.curr_dim}")
         print("-------------------")
-        print(f"layer           out_shape")
+        print(f"layer           out_shape           parameters shape")
 
-        current_encoder_layers = reversed(decoder_filters_list)
+        current_encoder_layers = reversed(current_decoder_inputs)
         f = next(current_encoder_layers)
         # fade in layers
         dims_prev = copy.copy(dims)
-        self.from_rgb, dims = new_conv2d(dims, f, kernel_size=(1, 1))
-        print(f"from_rgb           {dims.curr_dim}")
+        self.from_rgb, dims = new_conv2d(dims, from_rgb_channels, kernel_size=(1, 1))
+        print(f"from_rgb           {dims.curr_dim}         {next(self.from_rgb.parameters()).shape}")
+        self.from_rgb_prev, dims_prev = new_conv2d(dims_prev, f, kernel_size=(1, 1))
+        print(f"from_rgb_prev      {dims_prev.curr_dim}         {next(self.from_rgb_prev.parameters()).shape}")
         # average pooling halves size
         dims_prev.update_dims(
             DimsTransformer(size_transform=lambda x: [int(x[el] // 2) for el in range(len(x))]))
@@ -340,16 +345,15 @@ class Encoder(torch.nn.Module):
         print(f"average pooling           {avg_pooling2d_dims.curr_dim}")
         encoder_blocks = [EncoderBlock(dims.curr_dim, f)]
         dims.update_dims(transform=lambda _: encoder_blocks[-1].out_dims.curr_dim)
+
         print(f"block_0       {dims.curr_dim}")
         for i, f in enumerate(current_encoder_layers):
             encoder_blocks.append(EncoderBlock(dims.curr_dim, f))
             dims.update_dims(transform=lambda _: encoder_blocks[-1].out_dims.curr_dim)
             print(f"block_{i+1}       {dims.curr_dim}")
-            # print(f"Encoder: output shape={dims.curr_size()}")
         # We save the blocks in reverse order, so that when we save the oldest block will have index zero.
         # This way the existing blocks don't change when we add additional ones
         self.encoder_blocks_reverse = torch.nn.ModuleList(reversed(encoder_blocks))
-        # self.encoder_blocks = torch.nn.ModuleList(encoder_blocks)
         print("\n")
         if eval_model:
             self.eval()
@@ -364,17 +368,14 @@ class Encoder(torch.nn.Module):
         x_prev = torch.clone(x)
         x = self.from_rgb(x)
         x = self.encoder_blocks_reverse[-1](x)
-        # x = self.encoder_blocks[0](x)
         if not self.eval_model:
-            x_prev = self.from_rgb(x_prev)
+            x_prev = self.from_rgb_prev(x_prev)
             x_prev = torch.nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2), padding=(0, 0))(x_prev)
             x_prev = x_prev * (1 - alpha)
             x = x * alpha
             x = x + x_prev
         for i in reversed(range(len(self.encoder_blocks_reverse)-1)):
-        # for i in range(len(self.encoder_blocks) - 1):
             x = self.encoder_blocks_reverse[i](x)
-            # x = self.encoder_blocks[i+1](x)
         return x
 
 
@@ -439,8 +440,9 @@ class InfoWGAN:
                  decoder_filters_list, cp_dir, epochs_per_phase=5, batch_size=None,
                  info_lambda=100,
                  grad_lambda=10,
-                 new_run=False):
+                 max_image_shape=128):
         super(InfoWGAN, self).__init__()
+        self.max_image_shape = max_image_shape
         self.code_shape = [None, 1, 1, code_features]
         self.noise_features = noise_features
         self.code_features = code_features
@@ -493,13 +495,15 @@ class InfoWGAN:
                                    decoder_filters_list=self.decoder_filters_list,
                                    pixel_features=self.pixel_features,
                                    eval_model=eval_model)
-        current_decoder_layers = self.generator.current_decoder_layers
+        current_decoder_inputs = self.generator.current_decoder_inputs
+        from_rgb_channels = self.generator.from_rgb_channels
         self.coder = Encoder(batch_size=self.batch_size, image_shape=image_shape,
-                             decoder_filters_list=current_decoder_layers, eval_model=eval_model)
+                             current_decoder_inputs=current_decoder_inputs, from_rgb_channels=from_rgb_channels,
+                             eval_model=eval_model)
         self.coderHead = EncoderHead(batch_size=self.batch_size, code_shape=self.code_shape,
-                                     current_decoder_layers=current_decoder_layers)
+                                     current_decoder_layers=current_decoder_inputs)
         self.criticHead = CriticHead(batch_size=self.batch_size, code_shape=self.code_shape,
-                                     current_decoder_layers=current_decoder_layers)
+                                     current_decoder_layers=current_decoder_inputs)
 
     def models_to_device(self):
         self.generator.to(self.device)
@@ -559,6 +563,8 @@ class InfoWGAN:
                 progress_bar = tqdm(train_loader)
                 i = 0
                 for batch in progress_bar:
+                    if i > 0:  # DEBUG CHECKPOINTING, ONLY TRAIN 1 BATCH
+                        break
                     batch = batch.to(self.device)
                     losses, metrics = self.train_step(batch)
                     description = f"Epoch {epoch}; "
@@ -639,9 +645,10 @@ class InfoWGAN:
                             cleaned_checkpoint[outer_key].pop(key)
                         if "pixel" in key:
                             cleaned_checkpoint[outer_key].pop(key)
-                cleaned_checkpoint['epoch'] = 0
+                    cleaned_checkpoint['epoch'] = 0
 
             self.generator.load_state_dict(cleaned_checkpoint['generator_state_dict'], strict=False)
+            # [print(f'{k}: {v.shape}') for k, v in cleaned_checkpoint['coder_state_dict'].items()]
             self.coder.load_state_dict(cleaned_checkpoint['coder_state_dict'], strict=False)
             self.criticHead.load_state_dict(cleaned_checkpoint['critic_head_state_dict'], strict=False)
             self.coderHead.load_state_dict(cleaned_checkpoint['coder_head_state_dict'], strict=False)
@@ -665,8 +672,9 @@ class InfoWGAN:
                 self.image_shape = [checkpoint['image_shape'][0] * 2, checkpoint['image_shape'][0] * 2]
             else:
                 self.image_shape = checkpoint['image_shape']
-            if self.image_shape[0] >= 128:
-                print("Reached max image resolution. Done training")
+            if self.image_shape[0] > self.max_image_shape:
+
+                print(f"Finished training max image resolution [{self.max_image_shape},{self.max_image_shape}]. Done training")
                 return True
             print(f"Found checkpoint. Starting image shape={self.image_shape}")
         else:

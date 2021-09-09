@@ -31,7 +31,7 @@ def main_unet(station):
     head_filters_list = [3]
 
 
-def main_gan(station, new_run=True, cp_dir=None):
+def main_gan(station, max_image_shape, cp_dir=None):
     """
     Attempt #2
     We will use a GAN architecture similar to infoGAN: https://arxiv.org/pdf/1606.03657.pdf
@@ -57,8 +57,8 @@ def main_gan(station, new_run=True, cp_dir=None):
     Since each pixel has N components in the code, we need each component to be a gaussian of variance 1/sqrt(N)
     (this way the total variance is 1).
     :param station: {"aws", "home"}. run locally or on cloud
-    :param new_run
     :param cp_dir
+    :param max_image_shape: int. X (image_shape[0]) resolution of images at desired output
     :return:
     """
     if type(cp_dir) is str and '~' in cp_dir:
@@ -73,7 +73,7 @@ def main_gan(station, new_run=True, cp_dir=None):
     print("current working directory:", home)
     files_dir = f'{home}/images/*.jpg'
     i = 0
-    if new_run:
+    if cp_dir is None:
         while os.path.exists(f'{home}/session/run_{i+1}/'):
             i += 1
         os.mkdir(f'{home}/session/run_{i+1}/')
@@ -89,9 +89,10 @@ def main_gan(station, new_run=True, cp_dir=None):
                    pixel_features=8,
                    decoder_filters_list=[64, 64, 32, 32, 16, 16, 8],
                    cp_dir=cp_dir,
-                   epochs_per_phase=100,
+                   epochs_per_phase=1,
                    info_lambda=100,
-                   grad_lambda=10)
+                   grad_lambda=10,
+                   max_image_shape=max_image_shape)
     gan.fit()
 
 
@@ -111,4 +112,4 @@ if __name__ == "__main__":
     #     main_unet(args.station)
 
     if args.v == 2:
-        main_gan(args.station, new_run=args.new_run, cp_dir=args.cp_dir)
+        main_gan(args.station, cp_dir=args.cp_dir, max_image_shape=128)
