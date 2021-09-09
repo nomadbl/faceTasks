@@ -563,8 +563,6 @@ class InfoWGAN:
                 progress_bar = tqdm(train_loader)
                 i = 0
                 for batch in progress_bar:
-                    if i > 0:  # DEBUG CHECKPOINTING, ONLY TRAIN 1 BATCH
-                        break
                     batch = batch.to(self.device)
                     losses, metrics = self.train_step(batch)
                     description = f"Epoch {epoch}; "

@@ -89,7 +89,7 @@ def main_gan(station, max_image_shape, cp_dir=None):
                    pixel_features=8,
                    decoder_filters_list=[64, 64, 32, 32, 16, 16, 8],
                    cp_dir=cp_dir,
-                   epochs_per_phase=1,
+                   epochs_per_phase=100,
                    info_lambda=100,
                    grad_lambda=10,
                    max_image_shape=max_image_shape)
@@ -100,7 +100,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--v", dest="v", type=int, choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan")
     parser.add_argument("--station", dest="station", type=str, choices={"aws", "home"}, default="aws", required=False)
-    parser.add_argument("--new_run", dest="new_run", action='store_true', default=False, required=False)
     parser.add_argument("--checkpoint", "--c", dest="cp_dir", type=str, required=False)
     args = parser.parse_args()
 
