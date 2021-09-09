@@ -604,7 +604,7 @@ class InfoWGAN:
                 progress_bar.close()
 
             # checkpoint model
-            self.save_cp(0, losses)
+            self.save_cp('end', losses)
 
         self.tensorboard_writer.close()
 
@@ -627,9 +627,9 @@ class InfoWGAN:
 
     def load_cp(self, load_optimizer_state=False):
         if os.path.exists(os.path.join(self.cp_dir, "checkpoint.pth")):
-            checkpoint = torch.load(os.path.join(self.cp_dir, "checkpoint.pth"))
+            checkpoint = torch.load(os.path.join(self.cp_dir, "checkpoint.pth"), map_location=self.device)
             cleaned_checkpoint = copy.deepcopy(checkpoint)
-            if checkpoint['epoch'] == 0:
+            if checkpoint['epoch'] == 'end':
                 # purge fade in layers from checkpoint dict so they are not loaded
                 for outer_key in checkpoint.keys():
                     if type(checkpoint[outer_key]) not in [collections.OrderedDict, dict]:
@@ -639,12 +639,12 @@ class InfoWGAN:
                             cleaned_checkpoint[outer_key].pop(key)
                         if "pixel" in key:
                             cleaned_checkpoint[outer_key].pop(key)
+                cleaned_checkpoint['epoch'] = 0
 
             self.generator.load_state_dict(cleaned_checkpoint['generator_state_dict'], strict=False)
             self.coder.load_state_dict(cleaned_checkpoint['coder_state_dict'], strict=False)
             self.criticHead.load_state_dict(cleaned_checkpoint['critic_head_state_dict'], strict=False)
             self.coderHead.load_state_dict(cleaned_checkpoint['coder_head_state_dict'], strict=False)
-            self.image_shape = cleaned_checkpoint['image_shape']
             if load_optimizer_state:
                 self.g_optimizer.load_state_dict(cleaned_checkpoint['g_optimizer_state_dict'])
                 self.d_optimizer.load_state_dict(cleaned_checkpoint['d_optimizer_state_dict'])
@@ -660,8 +660,11 @@ class InfoWGAN:
         :return: return True if training is done
         """
         if os.path.exists(os.path.join(self.cp_dir, "checkpoint.pth")):
-            checkpoint = torch.load(os.path.join(self.cp_dir, "checkpoint.pth"))
-            self.image_shape = [checkpoint['image_shape'][0] * 2, checkpoint['image_shape'][0] * 2]
+            checkpoint = torch.load(os.path.join(self.cp_dir, "checkpoint.pth"), map_location=self.device)
+            if checkpoint['epoch'] == 'end':
+                self.image_shape = [checkpoint['image_shape'][0] * 2, checkpoint['image_shape'][0] * 2]
+            else:
+                self.image_shape = checkpoint['image_shape']
             if self.image_shape[0] >= 128:
                 print("Reached max image resolution. Done training")
                 return True

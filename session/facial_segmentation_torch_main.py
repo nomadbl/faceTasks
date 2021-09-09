@@ -58,9 +58,12 @@ def main_gan(station, new_run=True, cp_dir=None):
     (this way the total variance is 1).
     :param station: {"aws", "home"}. run locally or on cloud
     :param new_run
+    :param cp_dir
     :return:
     """
-
+    if type(cp_dir) is str and '~' in cp_dir:
+        homedir = os.getenv('HOME')
+        cp_dir = cp_dir.replace('~', homedir)
     home = None
     if station == "aws":
         home = os.getcwd()
