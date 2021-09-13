@@ -31,7 +31,7 @@ def main_unet(station):
     head_filters_list = [3]
 
 
-def main_gan(station, max_image_shape, cp_dir=None):
+def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_clipping=False, gradient_centralization=False):
     """
     Attempt #2
     We will use a GAN architecture similar to infoGAN: https://arxiv.org/pdf/1606.03657.pdf
@@ -92,15 +92,25 @@ def main_gan(station, max_image_shape, cp_dir=None):
                    epochs_per_phase=100,
                    info_lambda=100,
                    grad_lambda=10,
+                   lr=lr,
+                   adaptive_gradient_clipping=adaptive_gradient_clipping,
+                   gradient_centralization=gradient_centralization,
                    max_image_shape=max_image_shape)
     gan.fit()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--v", dest="v", type=int, choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan")
-    parser.add_argument("--station", dest="station", type=str, choices={"aws", "home"}, default="aws", required=False)
-    parser.add_argument("--checkpoint", "--c", dest="cp_dir", type=str, required=False)
+    parser.add_argument("--v", dest="v", type=int,
+                        choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan")
+    parser.add_argument("--station", dest="station", type=str,
+                        choices={"aws", "home"}, default="aws", required=False)
+    parser.add_argument("--checkpoint", "--c",
+                        dest="cp_dir", type=str, required=False)
+    parser.add_argument("--lr", type=float, dest="lr",
+                        required=False, default=0.001)
+    parser.add_argument("--agc", action="store_true")
+    parser.add_argument("--gc", action="store_true")
     args = parser.parse_args()
 
     print(f"running pytorch version {torch.__version__}")
@@ -111,4 +121,5 @@ if __name__ == "__main__":
     #     main_unet(args.station)
 
     if args.v == 2:
-        main_gan(args.station, cp_dir=args.cp_dir, max_image_shape=128)
+        main_gan(args.station, cp_dir=args.cp_dir,
+                 max_image_shape=128, lr=args.lr, adaptive_gradient_clipping=args.agc, gradient_centralization=args.gc)
