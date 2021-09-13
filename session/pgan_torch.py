@@ -288,7 +288,7 @@ class Generator(torch.nn.Module):
                 transform=lambda _: self.generator_blocks[-1].out_dims.curr_dim)
             print(f"block_{i}           {dims.curr_dim}")
             current_decoder_inputs.append(dims.prev_channels())
-            if dims.curr_size() == self.image_shape:
+            if tuple(dims.curr_size()) == self.image_shape:
                 break
 
         # output channels of first encoder block
@@ -478,7 +478,7 @@ class InfoWGAN:
                  lr=0.001,
                  adaptive_gradient_clipping=False,
                  gradient_centralization=False,
-                 start_image_shape=[4, 4],
+                 start_image_shape=(4, 4),
                  max_image_shape=128):
         super(InfoWGAN, self).__init__()
         self.max_image_shape = max_image_shape
@@ -490,12 +490,12 @@ class InfoWGAN:
         self.pixel_features = pixel_features
         self.batch_sizes = batch_sizes
         if self.batch_sizes is None:
-            self.batch_sizes = {[4, 4]: 512,
-                                [8, 8]: 512,
-                                [16, 16]: 215,
-                                [32, 32]: 215,
-                                [64, 64]: 128,
-                                [128, 128]: 64}
+            self.batch_sizes = {(4, 4): 512,
+                                (8, 8): 512,
+                                (16, 16): 256,
+                                (32, 32): 256,
+                                (64, 64): 128,
+                                (128, 128): 64}
 
         self.cp_dir = cp_dir
         if not os.path.exists(cp_dir):
@@ -539,19 +539,19 @@ class InfoWGAN:
         :param eval_model: return evaluation models if True. defaults to False
         :return: None
         """
-        self.generator = Generator(self.batch_sizes, code_shape=self.code_shape,
+        self.generator = Generator(self.batch_sizes[image_shape], code_shape=self.code_shape,
                                    noise_features=self.noise_features, image_shape=image_shape,
                                    decoder_filters_list=self.decoder_filters_list,
                                    pixel_features=self.pixel_features,
                                    eval_model=eval_model)
         current_decoder_inputs = self.generator.current_decoder_inputs
         from_rgb_channels = self.generator.from_rgb_channels
-        self.coder = Encoder(batch_size=self.batch_sizes, image_shape=image_shape,
+        self.coder = Encoder(batch_size=self.batch_sizes[image_shape], image_shape=image_shape,
                              current_decoder_inputs=current_decoder_inputs, from_rgb_channels=from_rgb_channels,
                              eval_model=eval_model)
-        self.coderHead = EncoderHead(batch_size=self.batch_sizes, code_shape=self.code_shape,
+        self.coderHead = EncoderHead(batch_size=self.batch_sizes[image_shape], code_shape=self.code_shape,
                                      current_decoder_layers=current_decoder_inputs)
-        self.criticHead = CriticHead(batch_size=self.batch_sizes, code_shape=self.code_shape,
+        self.criticHead = CriticHead(batch_size=self.batch_sizes[image_shape], code_shape=self.code_shape,
                                      current_decoder_layers=current_decoder_inputs)
 
     def models_to_device(self):
@@ -609,28 +609,22 @@ class InfoWGAN:
                     self.curr_epoch % self.epochs_per_phase + 1) / self.epochs_per_phase
                 # get datasets of resized images
                 train_loader = DataLoader(
-                    train_ds, batch_size=self.batch_sizes, shuffle=True, num_workers=3)
+                    train_ds, batch_size=self.batch_sizes[self.image_shape], shuffle=True, num_workers=3)
                 n_total_steps = len(train_loader)
                 progress_bar = tqdm(train_loader)
+                description = f"Epoch {epoch}"
+                progress_bar.set_description(description)
                 i = 0
-                # with torch.profiler.profile(
-                #     schedule=torch.profiler.schedule(
-                #         wait=2, warmup=2, active=6, repeat=1),
-                #     on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                #         os.path.join(self.cp_dir, "profiling")),
-                #     with_stack=True
-                # ) as profiler:
                 for batch in progress_bar:
                     batch = batch.to(self.device)
                     losses, metrics = self.train_step(batch)
-                    description = f"Epoch {epoch}; "
+
                     global_step = epoch * n_total_steps + i
                     for scalar, value in chain(iter(losses.items()), iter(metrics.items())):
                         if scalar not in running.keys():
                             running[scalar] = 0.0
                         running[scalar] += value.item()
-                        # description += f"{scalar} {value.item():.3f}; "
-                    progress_bar.set_description(description)
+
                     if (i + 1) % (n_total_steps // 4) == 0:
                         for scalar, value in running.items():
                             self.tensorboard_writer.add_scalars(scalar,
@@ -654,19 +648,16 @@ class InfoWGAN:
                                 if scalar not in eval_running.keys():
                                     eval_running[scalar] = 0.0
                                 eval_running[scalar] += value.item()
-                        description = f"Epoch {epoch}, TEST: "
                         for scalar, value in eval_running.items():
                             # description += f"{scalar} {value / test_steps:.3f}; "
                             self.tensorboard_writer.add_scalars(scalar,
                                                                 {"test": value / test_steps}, global_step)
-                        progress_bar.set_description(description)
                         for scalar in running:
                             eval_running[scalar] = 0.0
                         # checkpoint model
                         self.save_cp(epoch, losses)
                     i += 1
-                    # profiler.step()
-                    progress_bar.close()
+                progress_bar.close()
 
             # checkpoint model
             self.save_cp('end', losses)
@@ -738,11 +729,13 @@ class InfoWGAN:
         curr_checkpoint = f"checkpoint_{self.start_image_shape[0]}_{self.start_image_shape[1]}.pth"  # default value
         if os.path.exists(self.cp_dir):
             # find latest checkpoint
+
             checkpoints = glob.glob(os.path.join(
                 self.cp_dir, "checkpoint_*_*.pth"))
             if len(checkpoints) > 0:
                 def get_image_shape_from_cp(cp):
-                    fn = cp.split(sep='.')[0]
+                    fn = cp.split(sep='/')[-1]
+                    fn = fn.split(sep='.')[0]
                     _, i, _ = fn.split(sep='_')
                     return int(i)
                 checkpoints_by_image_shape = {
@@ -754,8 +747,8 @@ class InfoWGAN:
             checkpoint = torch.load(os.path.join(
                 self.cp_dir, curr_checkpoint), map_location=self.device)
             if checkpoint['epoch'] == 'end':
-                self.image_shape = [checkpoint['image_shape']
-                                    [0] * 2, checkpoint['image_shape'][0] * 2]
+                self.image_shape = (checkpoint['image_shape']
+                                    [0] * 2, checkpoint['image_shape'][0] * 2)
             else:
                 self.image_shape = checkpoint['image_shape']
             if self.image_shape[0] > self.max_image_shape:
@@ -871,21 +864,24 @@ class InfoWGAN:
     def get_clipped_grad(self, params: torch.Tensor, l=0.5, epsilon=0.001):
         if params.grad is None:
             return None
-        l = torch.tensor(l, dtype=torch.float32, device=self.device)
-        w_norm = torch.functional.norm(params, keepdim=True)
-        epsilon = torch.tensor(epsilon, dtype=torch.float32, device=self.device) * \
-            torch.ones_like(w_norm, device=self.device)
-        w_norm = torch.max(w_norm, epsilon)
-        g_norm = torch.functional.norm(params.grad, keepdim=True)
-        cond = torch.greater(torch.divide(g_norm, w_norm), l)
-        return torch.where(cond, l * g_norm / w_norm * params.grad, params.grad)
+        with torch.no_grad():
+            l = torch.tensor(l, dtype=torch.float32, device=self.device)
+            dims = list(range(1, len(params.shape)))
+            w_norm = torch.norm(params, dim=dims, keepdim=True, p=2)
+            epsilon = torch.tensor(epsilon, dtype=torch.float32, device=self.device) * \
+                torch.ones_like(w_norm, device=self.device)
+            w_norm = torch.max(w_norm, epsilon)
+            g_norm = torch.norm(params.grad, dim=dims, keepdim=True, p=2)
+            cond = torch.greater(torch.divide(g_norm, w_norm), l)
+            return torch.where(cond, l * torch.divide(w_norm, g_norm) * params.grad, params.grad)
 
     def centralized_grad(self, params: torch.Tensor):
         if params.grad is None:
             return None
-        dims = list(range(1, len(params.shape)))
-        centers = torch.sum(params.grad, dim=dims, keepdim=True)
-        return params.grad - centers
+        with torch.no_grad():
+            dims = list(range(1, len(params.shape)))
+            centers = torch.mean(params.grad, dim=dims, keepdim=True)
+            return params.grad - centers
 
     def train_step(self, images):
         curr_epoch = torch.tensor(
