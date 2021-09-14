@@ -31,7 +31,7 @@ def main_unet(station):
     head_filters_list = [3]
 
 
-def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_clipping=False, gradient_centralization=False):
+def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_clipping=False, gradient_centralization=False, next=False):
     """
     Attempt #2
     We will use a GAN architecture similar to infoGAN: https://arxiv.org/pdf/1606.03657.pdf
@@ -95,22 +95,27 @@ def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_
                    lr=lr,
                    adaptive_gradient_clipping=adaptive_gradient_clipping,
                    gradient_centralization=gradient_centralization,
-                   max_image_shape=max_image_shape)
+                   max_image_shape=max_image_shape,
+                   next=next)
     gan.fit()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--v", dest="v", type=int,
-                        choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan")
+                        choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan", help="unet or gan training")
     parser.add_argument("--station", dest="station", type=str,
-                        choices={"aws", "home"}, default="aws", required=False)
+                        choices={"aws", "home"}, default="aws", required=False, help="local machine or aws deployment")
     parser.add_argument("--checkpoint", "--c",
-                        dest="cp_dir", type=str, required=False)
+                        dest="cp_dir", type=str, required=False, help="resume training from latest checkpoint in specified folder")
     parser.add_argument("--lr", type=float, dest="lr",
-                        required=False, default=0.001)
-    parser.add_argument("--agc", action="store_true")
-    parser.add_argument("--gc", action="store_true")
+                        required=False, default=0.001, help="learning rate")
+    parser.add_argument("--agc", action="store_true",
+                        help="activate adaptive gradient clipping")
+    parser.add_argument("--gc", action="store_true",
+                        help="activate gradient centering algorithm")
+    parser.add_argument("--next", action="store_true",
+                        help="skip to next image resolution in pGAN training")
     args = parser.parse_args()
 
     print(f"running pytorch version {torch.__version__}")
@@ -122,4 +127,4 @@ if __name__ == "__main__":
 
     if args.v == 2:
         main_gan(args.station, cp_dir=args.cp_dir,
-                 max_image_shape=128, lr=args.lr, adaptive_gradient_clipping=args.agc, gradient_centralization=args.gc)
+                 max_image_shape=128, lr=args.lr, adaptive_gradient_clipping=args.agc, gradient_centralization=args.gc, next=args.next)

@@ -479,10 +479,12 @@ class InfoWGAN:
                  adaptive_gradient_clipping=False,
                  gradient_centralization=False,
                  start_image_shape=(4, 4),
-                 max_image_shape=128):
+                 max_image_shape=128,
+                 start_from_next_resolution=False):
         super(InfoWGAN, self).__init__()
         self.max_image_shape = max_image_shape
         self.start_image_shape = start_image_shape
+        self.start_from_next_resolution = start_from_next_resolution
         self.image_shape = start_image_shape
         self.code_shape = [None, 1, 1, code_features]
         self.noise_features = noise_features
@@ -490,10 +492,10 @@ class InfoWGAN:
         self.pixel_features = pixel_features
         self.batch_sizes = batch_sizes
         if self.batch_sizes is None:
-            self.batch_sizes = {(4, 4): 512,
-                                (8, 8): 512,
-                                (16, 16): 256,
-                                (32, 32): 256,
+            self.batch_sizes = {(4, 4): 256,
+                                (8, 8): 256,
+                                (16, 16): 128,
+                                (32, 32): 128,
                                 (64, 64): 128,
                                 (128, 128): 64}
 
@@ -746,7 +748,9 @@ class InfoWGAN:
         if os.path.exists(os.path.join(self.cp_dir, curr_checkpoint)):
             checkpoint = torch.load(os.path.join(
                 self.cp_dir, curr_checkpoint), map_location=self.device)
-            if checkpoint['epoch'] == 'end':
+            if checkpoint['epoch'] == 'end' or self.start_from_next_resolution:
+                if self.start_from_next_resolution:
+                    self.start_from_next_resolution = False  # only do once
                 self.image_shape = (checkpoint['image_shape']
                                     [0] * 2, checkpoint['image_shape'][0] * 2)
             else:
