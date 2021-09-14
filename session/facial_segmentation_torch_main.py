@@ -96,14 +96,14 @@ def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_
                    adaptive_gradient_clipping=adaptive_gradient_clipping,
                    gradient_centralization=gradient_centralization,
                    max_image_shape=max_image_shape,
-                   next=next)
+                   start_from_next_resolution=next)
     gan.fit()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--v", dest="v", type=int,
-                        choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan", help="unet or gan training")
+                        choices={1, 2}, default=2, required=False, help="1 - unet, 2 - gan")
     parser.add_argument("--station", dest="station", type=str,
                         choices={"aws", "home"}, default="aws", required=False, help="local machine or aws deployment")
     parser.add_argument("--checkpoint", "--c",
