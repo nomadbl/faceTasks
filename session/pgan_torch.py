@@ -492,12 +492,12 @@ class InfoWGAN:
         self.pixel_features = pixel_features
         self.batch_sizes = batch_sizes
         if self.batch_sizes is None:
-            self.batch_sizes = {(4, 4): 256,
-                                (8, 8): 256,
-                                (16, 16): 128,
-                                (32, 32): 128,
-                                (64, 64): 128,
-                                (128, 128): 64}
+            self.batch_sizes = {(4, 4): 650,
+                                (8, 8): 650,
+                                (16, 16): 512,
+                                (32, 32): 512,
+                                (64, 64): 512,
+                                (128, 128): 512}
 
         self.cp_dir = cp_dir
         if not os.path.exists(cp_dir):
@@ -533,6 +533,8 @@ class InfoWGAN:
 
         self.device = torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def build_models(self, image_shape, eval_model=False):
         """
@@ -633,7 +635,8 @@ class InfoWGAN:
                         for scalar, value in running.items():
                             self.tensorboard_writer.add_scalars(scalar,
                                                                 {"train": value / (n_total_steps // 4)}, global_step)
-                        self.write_tensorboard_summaries(global_step)
+                        self.write_tensorboard_summaries(
+                            batch[:9], global_step)
                         for scalar in running:
                             running[scalar] = 0.0
                     # save once mid epoch
@@ -1013,7 +1016,7 @@ class InfoWGAN:
                    "fake_criticism_std": fake_criticism_std}
         return losses, metrics
 
-    def write_tensorboard_summaries(self, global_step):
+    def write_tensorboard_summaries(self, real_images, global_step):
         with torch.no_grad():
             current_epoch = torch.tensor(
                 self.curr_epoch, dtype=torch.float32, device=self.device)
@@ -1038,6 +1041,13 @@ class InfoWGAN:
             img_grid = torchvision.utils.make_grid(generated_images)
             self.tensorboard_writer.add_image(
                 "generated images", img_grid, global_step=global_step)
+
+            real_images = torchvision.transforms.ConvertImageDtype(
+                torch.uint8)(real_images)
+            img_grid = torchvision.utils.make_grid(real_images)
+            self.tensorboard_writer.add_image(
+                "real images", img_grid, global_step=global_step)
+
             critic_params = torch.tensor(
                 [], dtype=torch.float32, device=self.device)
             for param in chain(self.coder.parameters(), self.criticHead.parameters()):

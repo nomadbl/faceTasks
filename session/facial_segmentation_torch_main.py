@@ -87,7 +87,7 @@ def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_
     gan = InfoWGAN(files_dir=files_dir,
                    code_features=code_features, noise_features=noise_features,
                    pixel_features=8,
-                   decoder_filters_list=[64, 64, 32, 32, 16, 16, 8],
+                   decoder_filters_list=[64, 64, 64, 32, 16, 16, 8],
                    cp_dir=cp_dir,
                    epochs_per_phase=100,
                    info_lambda=100,
