@@ -602,6 +602,8 @@ class InfoWGAN:
                          grad_lambda=0.001, info_lambda=0.001)
             # load checkpoint
             start_epoch = self.load_cp()
+            if self.start_from_next_resolution:
+                self.start_from_next_resolution = False  # only do once
             self.models_to_device()
 
             losses = None
@@ -684,13 +686,34 @@ class InfoWGAN:
         torch.save(cp_dict, os.path.join(
             self.cp_dir, f"checkpoint_{self.image_shape[0]}_{self.image_shape[1]}.pth"))
 
+    def get_latest_checkpoint(self):
+        # default value
+        curr_checkpoint = f"checkpoint_{self.start_image_shape[0]}_{self.start_image_shape[1]}.pth"
+        if os.path.exists(self.cp_dir):
+            # find latest checkpoint
+
+            checkpoints = glob.glob(os.path.join(
+                self.cp_dir, "checkpoint_*_*.pth"))
+            if len(checkpoints) > 0:
+                def get_image_shape_from_cp(cp):
+                    fn = cp.split(sep='/')[-1]
+                    fn = fn.split(sep='.')[0]
+                    _, i, _ = fn.split(sep='_')
+                    return int(i)
+                checkpoints_by_image_shape = {
+                    get_image_shape_from_cp(cp): cp for cp in checkpoints}
+                max_image_shape = max(checkpoints_by_image_shape.keys())
+                curr_checkpoint = checkpoints_by_image_shape[max_image_shape]
+
+        return curr_checkpoint
+
     def load_cp(self, load_optimizer_state=False):
-        curr_checkpoint = f"checkpoint_{self.image_shape[0]}_{self.image_shape[1]}.pth"
+        curr_checkpoint = self.get_latest_checkpoint()
         if os.path.exists(os.path.join(self.cp_dir, curr_checkpoint)):
             checkpoint = torch.load(os.path.join(
                 self.cp_dir, curr_checkpoint), map_location=self.device)
             cleaned_checkpoint = copy.deepcopy(checkpoint)
-            if checkpoint['epoch'] == 'end':
+            if checkpoint['epoch'] == 'end' or self.start_from_next_resolution:
                 # purge fade in layers from checkpoint dict so they are not loaded
                 for outer_key in checkpoint.keys():
                     if type(checkpoint[outer_key]) not in [collections.OrderedDict, dict]:
@@ -728,29 +751,12 @@ class InfoWGAN:
         update image shape from checkpoint or use default if no checkpoint exists
         :return: return True if training is done
         """
-        curr_checkpoint = f"checkpoint_{self.start_image_shape[0]}_{self.start_image_shape[1]}.pth"  # default value
-        if os.path.exists(self.cp_dir):
-            # find latest checkpoint
-
-            checkpoints = glob.glob(os.path.join(
-                self.cp_dir, "checkpoint_*_*.pth"))
-            if len(checkpoints) > 0:
-                def get_image_shape_from_cp(cp):
-                    fn = cp.split(sep='/')[-1]
-                    fn = fn.split(sep='.')[0]
-                    _, i, _ = fn.split(sep='_')
-                    return int(i)
-                checkpoints_by_image_shape = {
-                    get_image_shape_from_cp(cp): cp for cp in checkpoints}
-                max_image_shape = max(checkpoints_by_image_shape.keys())
-                curr_checkpoint = checkpoints_by_image_shape[max_image_shape]
+        curr_checkpoint = self.get_latest_checkpoint()
 
         if os.path.exists(os.path.join(self.cp_dir, curr_checkpoint)):
             checkpoint = torch.load(os.path.join(
                 self.cp_dir, curr_checkpoint), map_location=self.device)
             if checkpoint['epoch'] == 'end' or self.start_from_next_resolution:
-                if self.start_from_next_resolution:
-                    self.start_from_next_resolution = False  # only do once
                 self.image_shape = (checkpoint['image_shape']
                                     [0] * 2, checkpoint['image_shape'][0] * 2)
             else:
