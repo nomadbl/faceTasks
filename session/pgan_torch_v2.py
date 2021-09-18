@@ -1,11 +1,13 @@
+import itertools
 import os
 import copy
 import glob
 from typing import Iterable
 from torch._C import device, dtype
 from torch.autograd import grad
+from torch.nn.modules.container import ModuleList
 from tqdm import tqdm
-from itertools import chain
+from itertools import chain, filterfalse
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -186,38 +188,82 @@ def new_linear(curr_dims: DimsTracker, units):
     return linear, curr_dims
 
 
-class EncoderBlock(torch.nn.Module):
+class criticBlock(torch.nn.Module):
     def __init__(self, input_dim: list, filters, c_axis=C_AXIS):
+        super(criticBlock, self).__init__()
+        dims = DimsTracker(input_dim)
+        self.convs = ModuleList()
+        self.lns = ModuleList()
+        while not dims.curr_size() == [1, 1]:
+            conv, dims = new_conv2d(dims, filters)
+            self.convs.append(conv)
+            ln = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+            self.lns.append(ln)
+            # do maxpool
+            dims.update_dims(DimsTransformer(
+                size_transform=lambda x: [x[0] // 2, x[1] // 2]))
+        self.linear = torch.nn.Linear(in_features=filters, out_features=1)
+
+    def forward(self, inputs):
+        x = inputs
+        conv_iter = iter(self.convs)
+        ln_iter = iter(self.lns)
+        for conv, ln in itertools.zip_longest(conv_iter, ln_iter):
+            x = conv(x)
+            torch.nn.ReLU(inplace=True)(x)  # save some memory
+            x = ln(x)
+            x = torch.nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))(x)
+        x = torch.flatten(x, start_dim=1)
+        criticism = self.linear(x)
+        return criticism
+
+
+class EncoderBlock(torch.nn.Module):
+    """
+    inputs: X_i, X_(i-1)
+    Compute the conditional probability P(real|X_i,X_(i-1)) and a feature code
+    This implementation specializes in X being an image with varying resolution and 3 channels 
+    """
+
+    def __init__(self, input_dim: list, filters, code_features, c_axis=C_AXIS):
         super(EncoderBlock, self).__init__()
         dims = DimsTracker(input_dim)
-        input_dims = copy.copy(dims)
+        conditional_dim = copy.copy(dims)
+        conditional_dim.update_dims(DimsTransformer(
+            size_transform=lambda x: [x[0] // 2, x[1] // 2]))
         self.conv1, dims = new_conv2d(dims, filters=filters)
         self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
-        self.conv2, dims = new_conv2d(dims, filters=filters)
+        self.conv2, dims = new_conv2d(dims, filters=filters, stride=(
+            2, 2), padding=(1, 1))  # output image size halved
         self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
         # cat here
         dims.update_dims(transform=CatTransformer(
-            [dims, input_dims], cat_dim=c_axis))
-        self.conv3, dims = new_conv2d(dims, filters=filters, stride=(
-            2, 2), padding=(1, 1))  # output image size halved
+            [dims, conditional_dim], cat_dim=c_axis))
+        self.conv3, dims = new_conv2d(dims, filters=filters)
+        conv3dims = copy.copy(dims)
         self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
-
-        self.out_dims = dims
+        self.coder_layer, dims = new_conv2d(
+            dims, filters=code_features, kernel_size=(1, 1))
+        self.code_shape = copy.copy(dims)
+        self.critic = criticBlock(conv3dims.curr_dim, filters // 2)
 
     def forward(self, inputs):
-        inputs_cp = torch.clone(inputs)
-        x = self.conv1(inputs)  # output_dim_pre_concat
+        x, x_prev = inputs
+        x = self.conv1(x)  # output_dim_pre_concat
         x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
         x = self.ln1(x)
         x = self.conv2(x)
         x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
         x = self.ln2(x)
-        # skip connection, C_AXIS: filters * 2
-        x = torch.cat([x, inputs_cp], dim=C_AXIS)
+        # skip connection
+        x = torch.cat([x, x_prev], dim=C_AXIS)
         x = self.conv3(x)
         x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
         x = self.ln3(x)
-        return x
+        code = self.coder_layer(x)
+        code = torch.nn.LeakyReLU(negative_slope=0.1)(code)
+        criticism = self.critic(x)
+        return code, criticism
 
 
 class GeneratorBlock(torch.nn.Module):
@@ -231,6 +277,8 @@ class GeneratorBlock(torch.nn.Module):
         self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
         self.conv3, dims = new_conv2d(curr_dims=dims, filters=filters)
         self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+        self.to_rgb, dims = new_conv2d(
+            curr_dims=dims, filters=3, kernel_size=(1, 1))
 
         self.out_dims = dims
 
@@ -245,6 +293,8 @@ class GeneratorBlock(torch.nn.Module):
         y = torch.nn.ReLU()(y)
         y = self.ln3(y)
         y = x + y  # skip connection
+        y = self.to_rgb(y)
+        y = torch.tanh(y)
         return y
 
 
@@ -253,210 +303,159 @@ def to_image_tanh(x):
 
 
 class Generator(torch.nn.Module):
-    def __init__(self, batch_size, code_shape, noise_features, image_shape, decoder_filters_list, pixel_features,
+    def __init__(self, batch_size, code_features, noise_features, final_image_shape, decoder_filters_list,
                  eval_model):
         super(Generator, self).__init__()
-        self.image_shape = image_shape
-        self.pixel_features = pixel_features
+        self.final_image_shape = final_image_shape
         self.eval_model = eval_model
-        size = [code_shape[1], code_shape[2]]
-        channels = code_shape[3] + noise_features
+        size = [2, 2]
+        self.code_features = code_features
+        self.noise_features = noise_features
+        self.channels = 3 + code_features + noise_features
         if C_AXIS == 1:
-            inp_dims = DimsTracker(input_dim=[batch_size, channels, *size])
+            inp_dims = DimsTracker(
+                input_dim=[batch_size, self.channels, *size])
         else:
-            inp_dims = DimsTracker(input_dim=[batch_size, *size, channels])
-        print("building generator")
-        print(f"input shape {inp_dims.curr_dim}")
+            inp_dims = DimsTracker(
+                input_dim=[batch_size, *size, self.channels])
+        print("building generators")
         print("-------------------")
-        print(f"layer           out_shape")
-        dims = copy.copy(inp_dims)
-        dims.update_dims(FlattenTransformer())
-        print(f"flatten           {dims.curr_dim}")
-        units = dims.num_curr_features()
-        self.linear1, dims = new_linear(dims, units)
-        print(f"linear           {dims.curr_dim}")
+        print(f"layer       in_shape           out_shape")
         self.generator_blocks = torch.nn.ModuleList()
-        # reshape back to image shape
-        dims = copy.copy(inp_dims)
-        print(f"reshape           {dims.curr_dim}")
+        dims = inp_dims
         current_decoder_inputs = []
         decoder_filters_iter = iter(decoder_filters_list)
         for i, f in enumerate(decoder_filters_iter):
             self.generator_blocks.append(GeneratorBlock(dims.curr_dim, f))
-            dims_prev = copy.copy(dims)
             dims.update_dims(
                 transform=lambda _: self.generator_blocks[-1].out_dims.curr_dim)
-            print(f"block_{i}           {dims.curr_dim}")
+            print(f"block_{i}        {dims.prev_dim}          {dims.curr_dim}")
             current_decoder_inputs.append(dims.prev_channels())
-            if tuple(dims.curr_size()) == self.image_shape:
+            if tuple(dims.curr_size()) == self.final_image_shape:
                 break
+            # input of all blocks is always "channels" channels
+            dims.update_dims(
+                transform=DimsTransformer(channels_transform=lambda x: self.channels))
 
-        # output channels of first encoder block
-        self.from_rgb_channels = dims.curr_channels()
-        self.current_decoder_inputs = current_decoder_inputs
+        # only train last (most recent) block
+        for i in range(len(current_decoder_inputs)-1):
+            for param in self.generator_blocks[i].parameters():
+                param.requires_grad = False
 
-        self.pixel_features_conv, dims = new_conv2d(
-            curr_dims=dims, filters=self.pixel_features, kernel_size=(1, 1))
-        print(f"pixel_features_conv           {dims.curr_dim}")
-        self.to_rgb, dims = new_conv2d(
-            curr_dims=dims, filters=3, kernel_size=(1, 1))
-        print(f"to_rgb           {dims.curr_dim}")
-        # upsample x_prev
-        dims_prev.update_dims(transform=DimsTransformer(
-            size_transform=lambda xs: [x * 2 for x in xs]))
-        print(f"upsample2d           {dims_prev.curr_dim}")
-        self.to_rgb_prev, to_rgb_prev_dims = new_conv2d(
-            curr_dims=dims_prev, filters=3, kernel_size=(1, 1))
-        print(f"to_rgb_prev           {to_rgb_prev_dims.curr_dim}")
         print("\n")
         if eval_model:
             self.eval()
 
-        self.out_dims = dims
+        self.set_training_index(-1)
+
+    def set_training_index(self, index: -1):
+        self.current_training_index = 0 if index < 0 else index
+        self.out_dims = self.generator_blocks[index].out_dims
 
     def forward(self, inputs: torch.Tensor):
         if self.eval_model:
-            x_inp = inputs
+            # [code0, code1...] = inputs.
+            if C_AXIS == 1:
+                x = torch.zeros(inputs[0].shape[0], 3, *inputs[0].shape[2:])
+            else:
+                x = torch.zeros(inputs[0].shape[0], *inputs[0].shape[1:3], 3)
+            output = [x]  # include initial code and zeros
+            for block, code in zip(self.generator_blocks, inputs):
+                x = torch.cat([x, code], dim=C_AXIS)
+                x = block(x)
+                output.append(x)
+            return output
         else:
-            x_inp, alpha = inputs
-        x = torch.reshape(x_inp, shape=[x_inp.shape[0], -1])
-        x = self.linear1(x)
-        x = torch.reshape(x, shape=x_inp.shape)
-        x = torch.nn.LeakyReLU(negative_slope=0.2)(x)
-        for block in self.generator_blocks:
-            x_prev = torch.clone(x)
-            x = block(x)
-        x = self.pixel_features_conv(x)
-        x = torch.nn.ReLU()(x)
-        x = self.to_rgb(x)
-        if not self.eval_model:
-            x_prev = torch.nn.UpsamplingNearest2d(scale_factor=2)(x_prev)
-            x_prev = self.to_rgb_prev(x_prev)
-            x_prev = x_prev * (1 - alpha)
-            x = x * alpha
-            x = x + x_prev
-        x = torch.nn.Tanh()(x)
-        return x
+            # code = inputs. x already appended to code
+            x = self.generator_blocks[self.current_training_index](inputs)
+            return x
 
 
-class Encoder(torch.nn.Module):
-    def __init__(self, batch_size, image_shape, current_decoder_inputs, from_rgb_channels,
+class Critic(torch.nn.Module):
+    """
+    Conditional discriminator and decoder
+    criticism, codes = critic(x)
+    where the conditional criticism is for the specified image shape and the 
+    codes are the concatenation of all the codes.
+    """
+
+    def __init__(self, batch_size, code_features, noise_features, decoder_filters_list,
                  eval_model):
-        super(Encoder, self).__init__()
-        size = [image_shape[0], image_shape[1]]
-        channels = 3
-        if C_AXIS == 1:
-            dims = DimsTracker(input_dim=[batch_size, channels, *size])
-        else:
-            dims = DimsTracker(input_dim=[batch_size, *size, channels])
-        self.eval_model = eval_model
-        print("building encoder")
-        print(f"input shape {dims.curr_dim}")
+        super(Critic, self).__init__()
+        # size = [final_image_shape[0], final_image_shape[1]]
+        self.code_features = code_features
+        print("building critics")
         print("-------------------")
-        print(f"layer           out_shape           parameters shape")
+        print(f"layer           in_shape        out_shape           parameters shape")
 
-        current_encoder_layers = reversed(current_decoder_inputs)
-        f = next(current_encoder_layers)
-        # fade in layers
-        dims_prev = copy.copy(dims)
-        self.from_rgb, dims = new_conv2d(
-            dims, from_rgb_channels, kernel_size=(1, 1))
-        print(
-            f"from_rgb           {dims.curr_dim}         {next(self.from_rgb.parameters()).shape}")
-        self.from_rgb_prev, dims_prev = new_conv2d(
-            dims_prev, f, kernel_size=(1, 1))
-        print(
-            f"from_rgb_prev      {dims_prev.curr_dim}         {next(self.from_rgb_prev.parameters()).shape}")
-        # average pooling halves size
-        dims_prev.update_dims(
-            DimsTransformer(size_transform=lambda x: [int(x[el] // 2) for el in range(len(x))]))
-        avg_pooling2d_dims = dims_prev
-        print(f"average pooling           {avg_pooling2d_dims.curr_dim}")
-        encoder_blocks = [EncoderBlock(dims.curr_dim, f)]
-        dims.update_dims(
-            transform=lambda _: encoder_blocks[-1].out_dims.curr_dim)
+        self.encoder_blocks = torch.nn.ModuleList()
+        size = [2, 2]
+        for i, f in enumerate(decoder_filters_list):
+            prev_size = size
+            size = [size[0] * 2, size[1] * 2]
+            input_dim = [batch_size, 3, *
+                         size] if C_AXIS == 1 else [batch_size, *size, 3]
+            output_dim = [batch_size, code_features, *
+                          prev_size] if C_AXIS == 1 else [batch_size, *prev_size, code_features]
+            dims = DimsTracker(input_dim)
+            out_dims = DimsTracker(output_dim)
+            self.encoder_blocks.append(EncoderBlock(
+                dims.curr_dim, f, self.code_features))
+            print(f"block_{i+1}     {dims.curr_dim}       {out_dims.curr_dim}")
 
-        print(f"block_0       {dims.curr_dim}")
-        for i, f in enumerate(current_encoder_layers):
-            encoder_blocks.append(EncoderBlock(dims.curr_dim, f))
-            dims.update_dims(
-                transform=lambda _: encoder_blocks[-1].out_dims.curr_dim)
-            print(f"block_{i+1}       {dims.curr_dim}")
-        # We save the blocks in reverse order, so that when we save the oldest block will have index zero.
-        # This way the existing blocks don't change when we add additional ones
-        self.encoder_blocks_reverse = torch.nn.ModuleList(
-            reversed(encoder_blocks))
         print("\n")
         if eval_model:
             self.eval()
+        self.eval_model = eval_model
+        self.set_training_index(0)
 
-        self.output_dims = dims
+    def set_training_index(self, index):
+        self.current_training_index = index
+        self.code_shape = self.encoder_blocks[index].code_shape
+
+    # get an iterator for coder parameters
+    def coder_params_iter(self):
+        filtered = filter(lambda x: "coder_layer" in x[0],
+                          self.named_parameters())
+        params_iter = map(lambda x: x[1], filtered)
+        return params_iter
+
+    # get an iterator for all non coder parameters
+    def critic_params_iter(self):
+        filtered = itertools.filterfalse(lambda x: "coder_layer" in x[0],
+                                         self.named_parameters())
+        params_iter = map(lambda x: x[1], filtered)
+        return params_iter
 
     def forward(self, inputs):
         if self.eval_model:
-            x = inputs
+            # at evaluation, get all codes and throw out the criticism signal
+            # [zeros, x_0, x_1, x_2...] = inputs
+            codes = []
+            for i in reversed(range(len(self.encoder_blocks_reverse))):
+                x_prev = inputs[i-1]
+                x = inputs[i]
+                code, _ = self.encoder_blocks_reverse[i]([x, x_prev])
+                codes.append(code)
+            return codes
         else:
-            x, alpha = inputs
-        x_prev = torch.clone(x)
-        x = self.from_rgb(x)
-        x = self.encoder_blocks_reverse[-1](x)
-        if not self.eval_model:
-            x_prev = self.from_rgb_prev(x_prev)
-            x_prev = torch.nn.AvgPool2d(kernel_size=(
-                2, 2), stride=(2, 2), padding=(0, 0))(x_prev)
-            x_prev = x_prev * (1 - alpha)
-            x = x * alpha
-            x = x + x_prev
-        for i in reversed(range(len(self.encoder_blocks_reverse)-1)):
-            x = self.encoder_blocks_reverse[i](x)
-        return x
-
-
-class CriticHead(torch.nn.Module):
-    def __init__(self, batch_size, code_shape, current_decoder_layers=None):
-        super(CriticHead, self).__init__()
-        if current_decoder_layers is None:
-            dims = DimsTracker(
-                input_dim=[batch_size, code_shape[1], code_shape[2], code_shape[3]])
-        else:
-            dims = DimsTracker(input_dim=[batch_size, code_shape[1], code_shape[2],
-                                          current_decoder_layers[0]])
-
-        self.linear1, dims = new_linear(dims, units=1)
-        self.output_dims = dims
-
-    def forward(self, inputs):
-        x = torch.reshape(inputs, shape=[inputs.shape[0], -1])
-        x = self.linear1(x)
-        return x
-
-
-class EncoderHead(torch.nn.Module):
-    def __init__(self, batch_size, code_shape, current_decoder_layers=None):
-        super(EncoderHead, self).__init__()
-        if current_decoder_layers is None:
-            dims = DimsTracker(
-                input_dim=[batch_size, code_shape[1], code_shape[2], code_shape[3]])
-        else:
-            dims = DimsTracker(input_dim=[batch_size, code_shape[1], code_shape[2],
-                                          current_decoder_layers[0]])
-
-        self.linear1, dims = new_linear(dims, units=code_shape[3])
-        self.output_dims = dims
-
-    def forward(self, inputs):
-        x = torch.reshape(inputs, shape=[inputs.shape[0], -1])
-        x = self.linear1(x)
-        return x
+            # x, xprev = inputs
+            # at training only use the relavant block
+            code, criticism = self.encoder_blocks[self.current_training_index](
+                inputs)
+            return code, criticism
 
 
 class FacesDataset(Dataset):
-    def __init__(self, files, size=(128, 128)):
+    def __init__(self, files, start_size=(4, 4), size=(128, 128)):
         self.files = files
         self.ln = len(files)
         self.size = size
+        self.prev_size = (size[0] // 2, size[1] // 2)
+        self.start_size = start_size
 
     def update_size(self, size):
+        self.prev_size = (size[0] // 2, size[1] // 2)
         self.size = size
 
     def __getitem__(self, item):
@@ -464,14 +463,21 @@ class FacesDataset(Dataset):
         file = torchvision.io.read_file(file)
         image = torchvision.io.decode_jpeg(file)
         image = torchvision.transforms.Resize(size=self.size)(image)
-        return torchvision.transforms.ConvertImageDtype(torch.float32)(image)
+        if self.prev_size is not self.start_size:
+            prev_image = torchvision.transforms.Resize(
+                size=self.prev_size)(image)
+        else:
+            prev_image = torch.zeros_like(image)
+            prev_image = torchvision.transforms.Resize(
+                size=self.prev_size)(prev_image)
+        return torchvision.transforms.ConvertImageDtype(torch.float32)(image), torchvision.transforms.ConvertImageDtype(torch.float32)(prev_image)
 
     def __len__(self):
         return self.ln
 
 
-class InfoWGAN:
-    def __init__(self, files_dir, code_features, noise_features, pixel_features,
+class stageGAN:
+    def __init__(self, files_dir, code_features_per_stage, noise_features,
                  decoder_filters_list, cp_dir, epochs_per_phase=5, batch_sizes=None,
                  info_lambda=100,
                  grad_lambda=10,
@@ -479,25 +485,31 @@ class InfoWGAN:
                  adaptive_gradient_clipping=False,
                  gradient_centralization=False,
                  start_image_shape=(4, 4),
-                 max_image_shape=128,
+                 final_image_shape=(128, 128),
                  start_from_next_resolution=False):
-        super(InfoWGAN, self).__init__()
-        self.max_image_shape = max_image_shape
+        super(stageGAN, self).__init__()
+        self.final_image_shape = final_image_shape
         self.start_image_shape = start_image_shape
         self.start_from_next_resolution = start_from_next_resolution
         self.image_shape = start_image_shape
-        self.code_shape = [None, 1, 1, code_features]
         self.noise_features = noise_features
-        self.code_features = code_features
-        self.pixel_features = pixel_features
+        self.code_features = code_features_per_stage
         self.batch_sizes = batch_sizes
         if self.batch_sizes is None:
-            self.batch_sizes = {(4, 4): 215,
-                                (8, 8): 215,
-                                (16, 16): 215,
-                                (32, 32): 215,
-                                (64, 64): 215,
-                                (128, 128): 215}
+            self.batch_sizes = {(4, 4): 256,
+                                (8, 8): 256,
+                                (16, 16): 128,
+                                (32, 32): 128,
+                                (64, 64): 128,
+                                (128, 128): 64}
+
+        tmp_image_shape = start_image_shape
+        self.training_indices = {}
+        ind = 0
+        while tmp_image_shape[0] <= final_image_shape[0]:
+            self.training_indices[tmp_image_shape] = ind
+            tmp_image_shape = (
+                2 * tmp_image_shape[0], 2 * tmp_image_shape[1])
 
         self.cp_dir = cp_dir
         if not os.path.exists(cp_dir):
@@ -513,17 +525,12 @@ class InfoWGAN:
         self.real_label = torch.tensor(-1, dtype=torch.float32)
         self.fake_label = torch.tensor(1, dtype=torch.float32)
 
-        self.current_alpha = None
-
         self.d_optimizer = None
         self.g_optimizer = None
-        self.q_optimizer = None
         self.grad_lambda = torch.tensor(info_lambda)
         self.info_lambda = torch.tensor(grad_lambda)
         self.generator = torch.nn.Module()
-        self.coder = torch.nn.Module()
-        self.coderHead = torch.nn.Module()
-        self.criticHead = torch.nn.Module()
+        self.critic = torch.nn.Module()
 
         self.lr = lr
         self.adaptive_gradient_clipping = adaptive_gradient_clipping
@@ -533,36 +540,32 @@ class InfoWGAN:
 
         self.device = torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
-    def build_models(self, image_shape, eval_model=False):
+    def build_models(self, batchl_size, eval_model=False):
         """
         initialize models and send to device
         :param image_shape: current image shape in pGAN training
         :param eval_model: return evaluation models if True. defaults to False
         :return: None
         """
-        self.generator = Generator(self.batch_sizes[image_shape], code_shape=self.code_shape,
-                                   noise_features=self.noise_features, image_shape=image_shape,
+
+        self.generator = Generator(batchl_size, code_features=self.code_features,
+                                   noise_features=self.noise_features, final_image_shape=self.final_image_shape,
                                    decoder_filters_list=self.decoder_filters_list,
-                                   pixel_features=self.pixel_features,
                                    eval_model=eval_model)
-        current_decoder_inputs = self.generator.current_decoder_inputs
-        from_rgb_channels = self.generator.from_rgb_channels
-        self.coder = Encoder(batch_size=self.batch_sizes[image_shape], image_shape=image_shape,
-                             current_decoder_inputs=current_decoder_inputs, from_rgb_channels=from_rgb_channels,
+        self.critic = Critic(batch_size=batchl_size, code_features=self.code_features,
+                             noise_features=self.noise_features,
+                             decoder_filters_list=self.decoder_filters_list,
                              eval_model=eval_model)
-        self.coderHead = EncoderHead(batch_size=self.batch_sizes[image_shape], code_shape=self.code_shape,
-                                     current_decoder_layers=current_decoder_inputs)
-        self.criticHead = CriticHead(batch_size=self.batch_sizes[image_shape], code_shape=self.code_shape,
-                                     current_decoder_layers=current_decoder_inputs)
+        if not eval_model:
+            self.generator.set_training_index(
+                self.training_indices[self.image_shape])
+            self.critic.set_training_index(
+                self.training_indices[self.image_shape])
 
     def models_to_device(self):
         self.generator.to(self.device)
-        self.coder.to(self.device)
-        self.coderHead.to(self.device)
-        self.criticHead.to(self.device)
+        self.critic.to(self.device)
 
     def get_image_dataset(self, files_dir):
         files = glob.glob(files_dir)
@@ -593,15 +596,14 @@ class InfoWGAN:
                 break
             print(f"learning rate = {self.lr}")
             train_ds, eval_ds = self.get_image_dataset(self.files_dir)
-            self.build_models(self.image_shape, eval_model=False)
-            self.compile(d_optimizer=torch.optim.Adam(chain(self.criticHead.parameters(),
-                                                            self.coder.parameters()),
+            batchl_size = self.batch_sizes[self.image_shape]
+            self.build_models(batchl_size, eval_model=False)
+
+            self.compile(d_optimizer=torch.optim.Adam(self.critic.critic_params_iter(),
                                                       lr=self.lr),
                          g_optimizer=torch.optim.Adam(
-                             self.generator.parameters(), lr=self.lr),
-                         q_optimizer=torch.optim.Adam(
-                             self.coderHead.parameters(), lr=self.lr),
-                         grad_lambda=0.001, info_lambda=0.001)
+                             chain(self.generator.parameters(), self.critic.coder_params_iter()), lr=self.lr),
+                         grad_lambda=10, info_lambda=0.01)
             # load checkpoint
             start_epoch = self.load_cp()
             if self.start_from_next_resolution:
@@ -611,8 +613,6 @@ class InfoWGAN:
             losses = None
             running = {}
             for epoch in range(start_epoch, self.epochs_per_phase):
-                self.current_alpha = (
-                    self.curr_epoch % self.epochs_per_phase + 1) / self.epochs_per_phase
                 # get datasets of resized images
                 train_loader = DataLoader(
                     train_ds, batch_size=self.batch_sizes[self.image_shape], shuffle=True, num_workers=3)
@@ -622,21 +622,22 @@ class InfoWGAN:
                 progress_bar.set_description(description)
                 i = 0
                 for batch in progress_bar:
-                    batch = batch.to(self.device)
+                    batch[0] = batch[0].to(self.device)
+                    batch[1] = batch[1].to(self.device)
                     losses, metrics = self.train_step(batch)
 
                     global_step = epoch * n_total_steps + i
                     for scalar, value in chain(iter(losses.items()), iter(metrics.items())):
                         if scalar not in running.keys():
                             running[scalar] = 0.0
-                        running[scalar] += value
+                        running[scalar] += value.item()
 
                     if (i + 1) % (n_total_steps // 4) == 0:
                         for scalar, value in running.items():
                             self.tensorboard_writer.add_scalars(scalar,
                                                                 {"train": value / (n_total_steps // 4)}, global_step)
                         self.write_tensorboard_summaries(
-                            batch[:9], global_step)
+                            batch, global_step)
                         for scalar in running:
                             running[scalar] = 0.0
                     # save once mid epoch
@@ -648,7 +649,8 @@ class InfoWGAN:
                         it = iter(eval_loader)
                         for step in range(test_steps):
                             images = next(it)
-                            images = images.to(self.device)
+                            images[0] = images[0].to(self.device)
+                            images[1] = images[1].to(self.device)
                             eval_losses, eval_metrics = self.test_step(
                                 images)
                             for scalar, value in chain(iter(eval_losses.items()), iter(eval_metrics.items())):
@@ -717,33 +719,17 @@ class InfoWGAN:
                 self.cp_dir, curr_checkpoint), map_location=self.device)
             cleaned_checkpoint = copy.deepcopy(checkpoint)
             if checkpoint['epoch'] == 'end' or self.start_from_next_resolution:
-                # purge fade in layers from checkpoint dict so they are not loaded
-                for outer_key in checkpoint.keys():
-                    if type(checkpoint[outer_key]) not in [collections.OrderedDict, dict]:
-                        continue
-                    for key in checkpoint[outer_key].keys():
-                        if "rgb" in key:
-                            cleaned_checkpoint[outer_key].pop(key)
-                        if "pixel" in key:
-                            cleaned_checkpoint[outer_key].pop(key)
-                    cleaned_checkpoint['epoch'] = 0
+                cleaned_checkpoint['epoch'] = 0
 
             self.generator.load_state_dict(
                 cleaned_checkpoint['generator_state_dict'], strict=False)
-            # [print(f'{k}: {v.shape}') for k, v in cleaned_checkpoint['coder_state_dict'].items()]
-            self.coder.load_state_dict(
-                cleaned_checkpoint['coder_state_dict'], strict=False)
-            self.criticHead.load_state_dict(
-                cleaned_checkpoint['critic_head_state_dict'], strict=False)
-            self.coderHead.load_state_dict(
-                cleaned_checkpoint['coder_head_state_dict'], strict=False)
+            self.critic.load_state_dict(
+                cleaned_checkpoint['critic_state_dict'], strict=False)
             if load_optimizer_state:
                 self.g_optimizer.load_state_dict(
                     cleaned_checkpoint['g_optimizer_state_dict'])
                 self.d_optimizer.load_state_dict(
                     cleaned_checkpoint['d_optimizer_state_dict'])
-                self.q_optimizer.load_state_dict(
-                    cleaned_checkpoint['q_optimizer_state_dict'])
             return cleaned_checkpoint['epoch']
         else:
             print("checkpoint file not found. Starting training from scratch")
@@ -778,80 +764,71 @@ class InfoWGAN:
 
     def compile(self, d_optimizer: torch.optim.Optimizer,
                 g_optimizer: torch.optim.Optimizer,
-                q_optimizer: torch.optim.Optimizer,
                 grad_lambda: float,
                 info_lambda: float):
         self.d_optimizer = d_optimizer
         self.g_optimizer = g_optimizer
-        self.q_optimizer = q_optimizer
         self.grad_lambda = torch.tensor(
             grad_lambda, dtype=torch.float32, device=self.device)
         self.info_lambda = torch.tensor(
             info_lambda, dtype=torch.float32, device=self.device)
 
     def test_step(self, images):
-
-        # progressive GAN alpha hyperparameter
         with torch.no_grad():
-            current_epoch = torch.tensor(
-                self.curr_epoch, dtype=torch.float32, device=self.device)
-            alpha = torch.divide(torch.add(torch.fmod(
-                current_epoch, self.epochs_per_phase), 1), self.epochs_per_phase)
             # Sample random points in the latent space
-            batch_size = images.shape[0]
-            size = [self.code_shape[1], self.code_shape[2]]
+            batch_size = images[0].shape[0]
             channels = self.code_features + self.noise_features
             if C_AXIS == 1:
+                size = [images[1].shape[2], images[1].shape[3]]
                 latent_shape = [batch_size, channels, *size]
             else:
+                size = [images[1].shape[1], images[1].shape[2]]
                 latent_shape = [batch_size, *size, channels]
             random_latent_vectors = torch.randn(
                 size=latent_shape, device=self.device)
-
+            coded_prev_image = torch.cat(
+                [images[1], random_latent_vectors], dim=C_AXIS)
             # Decode them to fake images
-            generated_images = self.generator([random_latent_vectors, alpha])
+            generated_images = self.generator(coded_prev_image)
 
             # gradient penalty
             eps = torch.rand([batch_size, 1, 1, 1],
                              dtype=torch.float32, device=self.device)
-            interp_images = torch.mul(eps, images) + \
+            interp_images = torch.mul(eps, images[0]) + \
                 torch.mul((1 - eps), generated_images)
 
         interp_images.requires_grad = True
 
-        for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+        for param in self.critic.parameters():
             param.requires_grad = False
-        conv_out_interp = self.coder([interp_images, alpha])
-        interp_criticism = self.criticHead(conv_out_interp).sum()
+        _, interp_criticism = self.critic([interp_images, images[1]])
+        interp_criticism = interp_criticism.sum()
         critic_x_grad = torch.autograd.grad(
             interp_criticism, interp_images, create_graph=True)
         critic_x_grad = torch.reshape(critic_x_grad[0], [batch_size, -1])
         penalty_loss = torch.mean(torch.square(
             torch.add(torch.norm(critic_x_grad, dim=-1, keepdim=True), -1)))
 
-        for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+        for param in self.critic.parameters():
             param.requires_grad = True
 
         with torch.no_grad():
             # Combine them with real images
-            combined_images = torch.cat([generated_images, images], dim=0)
+            combined_images = torch.cat([generated_images, images[0]], dim=0)
+            combined_prev_images = torch.cat([images[1], images[1]], dim=0)
 
             # Assemble labels discriminating real from fake images
             labels = torch.cat([self.fake_label * torch.ones((batch_size, 1), dtype=torch.float32, device=self.device),
                                 self.real_label * torch.ones((batch_size, 1), dtype=torch.float32, device=self.device)],
                                dim=0)
 
-            conv_out = self.coder([combined_images, alpha])
-            criticism = self.criticHead(conv_out)
+            code_prediction, criticism = self.critic(
+                [combined_images, combined_prev_images])
+            # retain only code with corresponding original code
+            code_prediction = code_prediction[:batch_size]
             wgan_loss = torch.mean(labels * criticism)
 
-            # Sample random points in the latent space
-            random_latent_vectors = torch.randn(
-                size=latent_shape, device=self.device)
             random_code = random_latent_vectors[:, :, :, :self.code_features]
-            fake_images = self.generator([random_latent_vectors, alpha])
-            conv = self.coder([fake_images, alpha])
-            code_prediction = self.coderHead(conv)
             info_loss = torch.mean(torch.square(code_prediction - random_code))
 
             real_criticism_mean = torch.mean(criticism[batch_size:])
@@ -897,47 +874,48 @@ class InfoWGAN:
             return params.grad - centers
 
     def train_step(self, images):
-        curr_epoch = torch.tensor(
-            self.curr_epoch, dtype=torch.int32, device=self.device)
-        # progressive GAN alpha hyper parameter
-        alpha = torch.divide(torch.add(torch.fmod(
-            curr_epoch, self.epochs_per_phase), 1), self.epochs_per_phase)
         # Sample random points in the latent space
-        batch_size = images.shape[0]
-        size = [self.code_shape[1], self.code_shape[2]]
+        batch_size = images[0].shape[0]
         channels = self.code_features + self.noise_features
         if C_AXIS == 1:
+            size = [images[1].shape[2], images[1].shape[3]]
             latent_shape = [batch_size, channels, *size]
         else:
+            size = [images[1].shape[1], images[1].shape[2]]
             latent_shape = [batch_size, *size, channels]
         random_latent_vectors = torch.randn(
             size=latent_shape, device=self.device)
 
+        coded_prev_image = torch.cat(
+            [images[1], random_latent_vectors], dim=C_AXIS)
         # Decode them to fake images
         with torch.no_grad():
-            generated_images = self.generator([random_latent_vectors, alpha])
+            generated_images = self.generator(coded_prev_image)
 
-            # Combine them with real images
-            combined_images = torch.cat([generated_images, images], dim=0)
+        # Combine them with real images
+        combined_images = torch.cat([generated_images, images[0]], dim=0)
+        combined_prev_images = torch.cat([images[1], images[1]], dim=0)
 
         # Assemble labels discriminating real from fake images
         labels = torch.cat([self.fake_label * torch.ones([batch_size, 1], device=self.device),
                             self.real_label * torch.ones([batch_size, 1], device=self.device)], dim=0)
 
         # Train the discriminator to optimality
+        wgan_loss = torch.tensor(0, dtype=torch.float32, device=self.device)
+        penalty_loss = torch.tensor(0, dtype=torch.float32, device=self.device)
         for step in range(5):
             # generate random "intermediate" images interpolating the generated and real images for gradient penalty
             eps = torch.rand(size=[batch_size, 1, 1, 1], device=self.device)
-            interp_images = torch.mul(eps, images) + \
+            interp_images = torch.mul(eps, images[0]) + \
                 torch.mul((1 - eps), generated_images)
             interp_images.requires_grad = True
 
-            conv_out = self.coder([combined_images, alpha])
-            criticism = self.criticHead(conv_out)
+            _, criticism = self.critic(
+                [combined_images, combined_prev_images])
             wgan_loss = torch.mean(torch.mul(labels, criticism))
 
-            conv_out_interp = self.coder([interp_images, alpha])
-            interp_criticism = self.criticHead(conv_out_interp).sum()
+            _, interp_criticism = self.critic([interp_images, images[1]])
+            interp_criticism = interp_criticism.sum()
             critic_x_grad = torch.autograd.grad(
                 interp_criticism, interp_images, create_graph=True)
             critic_x_grad = torch.reshape(critic_x_grad[0], [batch_size, -1])
@@ -947,17 +925,16 @@ class InfoWGAN:
             d_loss = self.grad_lambda * penalty_loss + wgan_loss
             d_loss.backward()
             if self.gradient_centralization:
-                for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+                for param in self.critic.critic_params_iter():
                     param.grad = self.centralized_grad(param)
             if self.adaptive_gradient_clipping:
-                for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+                for param in self.critic.critic_params_iter():
                     param.grad = self.get_clipped_grad(param)
             self.d_optimizer.step()
             self.d_optimizer.zero_grad()
 
             interp_images.grad.zero_()
             critic_x_grad.zero_()
-
         with torch.no_grad():
             real_criticism_mean = torch.mean(criticism[batch_size:])
             fake_criticism_mean = torch.mean(criticism[:batch_size])
@@ -972,29 +949,13 @@ class InfoWGAN:
             critic_accuracy = (predictions == (labels / 2 + 0.5)
                                ).float().sum() / (2 * batch_size)
 
-        del d_loss
-        del labels
-        float_wgan_loss = float(wgan_loss)
-        float_penalty_loss = float(penalty_loss)
-        del wgan_loss
-        del penalty_loss
-        del combined_images
-        del generated_images
-        del images
-        del random_latent_vectors
+        if C_AXIS == 1:
+            random_code = random_latent_vectors[:, :self.code_features, :, :]
+        else:
+            random_code = random_latent_vectors[:, :, :, :self.code_features]
 
-        if torch.cuda.is_available():
-            # print(
-            #     f"tensors occupy {torch.cuda.memory_allocated()/1024/1024}MB")
-            torch.cuda.empty_cache()
-            # print(
-            #     f"tensors occupy {torch.cuda.memory_allocated()/1024/1024}MB")
-
-        # Sample random points in the latent space
-        random_latent_vectors = torch.randn(
-            size=latent_shape, device=self.device)
-        random_code = random_latent_vectors[:, :, :, :self.code_features]
-
+        coded_prev_image = torch.cat(
+            [images[1], random_latent_vectors], dim=C_AXIS)
         # Assemble labels that say "all real images"
         # This makes the generator want to create real images (match the label) since
         # we do not include an additional minus in the loss
@@ -1002,61 +963,56 @@ class InfoWGAN:
             torch.ones([batch_size, 1], device=self.device)
 
         # Train the generator and encoder(note that we should *not* update the weights
-        # of the critic or encoder)!
-        fake_images = self.generator([random_latent_vectors, alpha])
-        for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+        # of the critic)!
+        fake_images = self.generator(coded_prev_image)
+
+        for param in self.critic.critic_params_iter():
             param.requires_grad = False
-        conv_out_fake = self.coder([fake_images, alpha])
-        fake_criticism = self.criticHead(conv_out_fake)
-        for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+        code_prediction, fake_criticism = self.critic([fake_images, images[1]])
+        for param in self.critic.critic_params_iter():
             param.requires_grad = True
-        code_prediction = self.coderHead(conv_out_fake)
         g_loss = torch.mean(misleading_labels * fake_criticism)
         info_loss = torch.mean(torch.square(code_prediction - random_code))
         total_g_loss = g_loss + self.info_lambda * info_loss
         total_g_loss.backward()
-
+        if self.gradient_centralization:
+            for param in chain(self.generator.parameters(), self.critic.coder_params_iter()):
+                param.grad = self.centralized_grad(param)
         if self.adaptive_gradient_clipping:
-            for param in chain(self.generator.parameters(), self.coderHead.parameters()):
+            for param in chain(self.generator.parameters(), self.critic.coder_params_iter()):
                 param.grad = self.get_clipped_grad(param)
 
         self.g_optimizer.step()
-        self.q_optimizer.step()
         self.g_optimizer.zero_grad()
-        self.q_optimizer.zero_grad()
 
-        float_info_loss = float(info_loss)
-        del info_loss
-        del g_loss
-        del total_g_loss
-
-        losses = {"critic_loss": -float_wgan_loss,
-                  "info_loss": float_info_loss,
-                  "gradient_penalty_loss": float_penalty_loss}
+        losses = {"critic_loss": -wgan_loss,
+                  "info_loss": info_loss,
+                  "gradient_penalty_loss": penalty_loss}
         metrics = {"critic_accuracy": critic_accuracy, "real_criticism_mean": real_criticism_mean,
                    "fake_criticism_mean": fake_criticism_mean, "real_criticism_std": real_criticism_std,
                    "fake_criticism_std": fake_criticism_std}
         return losses, metrics
 
-    def write_tensorboard_summaries(self, real_images, global_step):
+    def write_tensorboard_summaries(self, batch, global_step):
+        real_images, _ = batch
+        real_images = torch.clone(real_images[:9])
         with torch.no_grad():
-            current_epoch = torch.tensor(
-                self.curr_epoch, dtype=torch.float32, device=self.device)
-            alpha = torch.divide(torch.add(torch.fmod(
-                current_epoch, self.epochs_per_phase), 1), self.epochs_per_phase)
             # Sample random points in the latent space
             batch_size = 9
             size = [self.code_shape[1], self.code_shape[2]]
             channels = self.code_features + self.noise_features
             if C_AXIS == 1:
+                size = [real_images[1].shape[2], real_images[1].shape[3]]
                 latent_shape = [batch_size, channels, *size]
             else:
+                size = [real_images[1].shape[1], real_images[1].shape[2]]
                 latent_shape = [batch_size, *size, channels]
             random_latent_vectors = torch.randn(
                 size=latent_shape, device=self.device)
-
+            coded_image = torch.cat(
+                [random_latent_vectors, real_images[1]], dim=C_AXIS)
             # Decode them to fake images
-            generated_images = self.generator([random_latent_vectors, alpha])
+            generated_images = self.generator(coded_image)
             # make and save figure of images
             generated_images = torchvision.transforms.ConvertImageDtype(
                 torch.uint8)(generated_images)
@@ -1065,14 +1021,14 @@ class InfoWGAN:
                 "generated images", img_grid, global_step=global_step)
 
             real_images = torchvision.transforms.ConvertImageDtype(
-                torch.uint8)(real_images)
+                torch.uint8)(real_images[0])
             img_grid = torchvision.utils.make_grid(real_images)
             self.tensorboard_writer.add_image(
                 "real images", img_grid, global_step=global_step)
 
             critic_params = torch.tensor(
                 [], dtype=torch.float32, device=self.device)
-            for param in chain(self.coder.parameters(), self.criticHead.parameters()):
+            for param in self.critic.parameters():
                 with torch.no_grad():
                     critic_params = torch.cat(
                         [critic_params, torch.flatten(param.detach())])
