@@ -495,13 +495,15 @@ class stageGAN:
         self.noise_features = noise_features
         self.code_features = code_features_per_stage
         self.batch_sizes = batch_sizes
-        if self.batch_sizes is None:
-            self.batch_sizes = {(4, 4): 256,
-                                (8, 8): 256,
-                                (16, 16): 128,
-                                (32, 32): 128,
-                                (64, 64): 128,
-                                (128, 128): 64}
+        self.batch_sizes = {(4, 4): 256,
+                            (8, 8): 256,
+                            (16, 16): 128,
+                            (32, 32): 128,
+                            (64, 64): 128,
+                            (128, 128): 64}
+        if type(batch_sizes) is int:
+            for key in self.batch_sizes.keys():
+                self.batch_sizes[key] = batch_sizes
 
         tmp_image_shape = start_image_shape
         self.training_indices = {}
@@ -994,23 +996,25 @@ class stageGAN:
         return losses, metrics
 
     def write_tensorboard_summaries(self, batch, global_step):
-        real_images, _ = batch
+        real_images, real_prev_images = batch
         real_images = torch.clone(real_images[:9])
+        real_prev_images = torch.clone(real_prev_images[:9])
         with torch.no_grad():
             # Sample random points in the latent space
             batch_size = 9
-            size = [self.code_shape[1], self.code_shape[2]]
             channels = self.code_features + self.noise_features
             if C_AXIS == 1:
-                size = [real_images[1].shape[2], real_images[1].shape[3]]
-                latent_shape = [batch_size, channels, *size]
+                prev_size = [real_prev_images.shape[2],
+                             real_prev_images.shape[3]]
+                latent_shape = [batch_size, channels, *prev_size]
             else:
-                size = [real_images[1].shape[1], real_images[1].shape[2]]
-                latent_shape = [batch_size, *size, channels]
+                prev_size = [real_prev_images.shape[1],
+                             real_prev_images.shape[2]]
+                latent_shape = [batch_size, *prev_size, channels]
             random_latent_vectors = torch.randn(
                 size=latent_shape, device=self.device)
             coded_image = torch.cat(
-                [random_latent_vectors, real_images[1]], dim=C_AXIS)
+                [real_prev_images, random_latent_vectors], dim=C_AXIS)
             # Decode them to fake images
             generated_images = self.generator(coded_image)
             # make and save figure of images
@@ -1021,7 +1025,7 @@ class stageGAN:
                 "generated images", img_grid, global_step=global_step)
 
             real_images = torchvision.transforms.ConvertImageDtype(
-                torch.uint8)(real_images[0])
+                torch.uint8)(real_images)
             img_grid = torchvision.utils.make_grid(real_images)
             self.tensorboard_writer.add_image(
                 "real images", img_grid, global_step=global_step)
