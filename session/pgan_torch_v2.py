@@ -3,17 +3,18 @@ import os
 import copy
 import glob
 from typing import Iterable
+from torch import functional
 from torch._C import device, dtype
 from torch.autograd import grad
 from torch.nn.modules.container import ModuleList
 from tqdm import tqdm
-from itertools import chain, filterfalse
+from itertools import chain
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import functools
-import collections
+import operator
 import torch
 
 C_AXIS = 1
@@ -202,7 +203,8 @@ class criticBlock(torch.nn.Module):
         self.convs1on1 = ModuleList()
         self.lns = ModuleList()
         filters = input_dim[c_axis]
-        while not dims.curr_size() == [1, 1]:
+        linear_in_features = functools.reduce(operator.mul, input_dim[1:])
+        while not dims.curr_size() == [2, 2]:
             filters = filters * 2
             indim = copy.copy(dims)
             conv1, dims = new_conv2d(dims, filters)
@@ -217,7 +219,10 @@ class criticBlock(torch.nn.Module):
             # do maxpool
             dims.update_dims(DimsTransformer(
                 size_transform=lambda x: [x[0] // 2, x[1] // 2]))
-        self.linear = torch.nn.Linear(in_features=filters, out_features=1)
+            linear_in_features = functools.reduce(
+                operator.mul, dims.curr_dim[1:])
+        self.linear = torch.nn.Linear(
+            in_features=linear_in_features, out_features=1)
 
     def forward(self, inputs):
         x = inputs
@@ -292,24 +297,30 @@ class EncoderBlock(torch.nn.Module):
 
 
 class GeneratorBlock(torch.nn.Module):
-    def __init__(self, input_dim: list, filters):
+    def __init__(self, input_dim: list, filters, c_axis=C_AXIS):
         super(GeneratorBlock, self).__init__()
+        self.c_axis = c_axis
         dims = DimsTracker(input_dim)
+        skip_dims = copy.copy(dims)
+        skip_dims.update_dims(transform=DimsTransformer(
+            size_transform=lambda x: [x[0] * 2, x[1] * 2]))
         self.conv1, dims = new_conv_trans2d(
             dims, filters=filters)  # doubles input size
         self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
-        self.conv2, dims = new_conv2d(curr_dims=dims, filters=filters)
+        self.conv2, dims = new_conv2d(curr_dims=dims, filters=filters * 2)
         self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
-        self.conv3, dims = new_conv2d(curr_dims=dims, filters=filters)
+        self.conv3, dims = new_conv2d(curr_dims=dims, filters=filters * 4)
         self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+        dims.update_dims(CatTransformer([dims, skip_dims], cat_dim=c_axis))
         self.to_rgb, dims = new_conv2d(
             curr_dims=dims, filters=3, kernel_size=(1, 1))
 
         self.out_dims = dims
 
     def forward(self, inputs):
-        x = self.conv1(inputs)
-        y = torch.nn.ReLU()(x)
+        x = torch.nn.UpsamplingBilinear2d(scale_factor=2)(inputs)
+        y = self.conv1(inputs)
+        y = torch.nn.ReLU()(y)
         y = self.ln1(y)
         y = self.conv2(y)
         y = torch.nn.ReLU()(y)
@@ -317,9 +328,11 @@ class GeneratorBlock(torch.nn.Module):
         y = self.conv3(y)
         y = torch.nn.ReLU()(y)
         y = self.ln3(y)
-        y = x + y  # skip connection
+        y = torch.cat([x, y], dim=self.c_axis)  # skip connection
         y = self.to_rgb(y)
-        y = torch.tanh(y)
+        y = torch.tanh(y)  # range [-1, 1]
+        y = torch.mul(y, 1/2)  # range [-1/2, 1/2]
+        y = torch.add(y, 1/2)  # range [0, 1]
         return y
 
 
@@ -641,8 +654,10 @@ class stageGAN:
             running = {}
             for epoch in range(start_epoch, self.epochs_per_phase):
                 # get datasets of resized images
+                pin_memory = torch.cuda.is_available()
+                num_workers = 4 if torch.cuda.is_available() else 0
                 train_loader = DataLoader(
-                    train_ds, batch_size=self.batch_sizes[self.image_shape], shuffle=True, num_workers=3)
+                    train_ds, batch_size=self.batch_sizes[self.image_shape], shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
                 n_total_steps = len(train_loader)
                 progress_bar = tqdm(train_loader)
                 description = f"Epoch {epoch}"
@@ -915,11 +930,15 @@ class stageGAN:
         random_latent_vectors = torch.randn(
             size=latent_shape, device=self.device)
 
-        coded_prev_image = torch.cat(
-            [images[1], random_latent_vectors], dim=C_AXIS)
+        if self.image_shape == (4, 4):
+            generator_input = torch.cat(
+                [torch.zeros_like(images[1]), random_latent_vectors], dim=C_AXIS)
+        else:
+            generator_input = torch.cat(
+                [images[1], random_latent_vectors], dim=C_AXIS)
         # Decode them to fake images
         with torch.no_grad():
-            generated_images = self.generator(coded_prev_image)
+            generated_images = self.generator(generator_input)
 
         # Combine them with real images
         combined_images = torch.cat([generated_images, images[0]], dim=0)
@@ -983,8 +1002,12 @@ class stageGAN:
         else:
             random_code = random_latent_vectors[:, :, :, :self.code_features]
 
-        coded_prev_image = torch.cat(
-            [images[1], random_latent_vectors], dim=C_AXIS)
+        if self.image_shape == (4, 4):
+            generator_input = torch.cat(
+                [torch.zeros_like(images[1]), random_latent_vectors], dim=C_AXIS)
+        else:
+            generator_input = torch.cat(
+                [images[1], random_latent_vectors], dim=C_AXIS)
         # Assemble labels that say "all real images"
         # This makes the generator want to create real images (match the label) since
         # we do not include an additional minus in the loss
@@ -993,7 +1016,7 @@ class stageGAN:
 
         # Train the generator and encoder(note that we should *not* update the weights
         # of the critic)!
-        fake_images = self.generator(coded_prev_image)
+        fake_images = self.generator(generator_input)
 
         for param in self.critic.critic_params_iter():
             param.requires_grad = False

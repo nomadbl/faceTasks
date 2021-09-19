@@ -30,6 +30,22 @@ cmd1="${sshcmd} '"'source activate pytorch_latest_p37 && yes | pip uninstall tor
 echo "upgrade pytroch"
 eval $cmd1
 
+aliases='
+
+#My custom aliases
+alias tb="tensorboard --logdir session/ --port=6006 &"
+alias train="nohup python3 session/facial_segmentation_torch_main.py --v 3 --station aws --gc --agc --bs 512 > run_out &"
+alias disp="tail -f run_out"
+alias backup="rm session.zip && zip -r session.zip session/"
+alias stopall="ps aux | grep python | awk ""'"{print $2}"'"" | xargs -I {} kill -9 {}"
+alias source_torch="source activate pytorch_latest_p37"
+alias ll="ls -alF"
+'
+cmd1=${sshcmd}' "'"echo '${aliases}' >> .bashrc"'"'
+echo "set up aliases: tb, train, disp, backup"
+echo $cmd1
+eval $cmd1
+
 #echo "run: jupyter notebook & -> disown -h %1"
 echo "open tunnel"
 #echo "$cmd"
