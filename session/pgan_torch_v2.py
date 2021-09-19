@@ -189,18 +189,31 @@ def new_linear(curr_dims: DimsTracker, units):
 
 
 class criticBlock(torch.nn.Module):
+    """
+    res net architecture for identifying real vs fake conditional distribution
+    """
+
     def __init__(self, input_dim: list, c_axis=C_AXIS):
         super(criticBlock, self).__init__()
+        self.c_axis = c_axis
         dims = DimsTracker(input_dim)
-        self.convs = ModuleList()
+        self.convs1 = ModuleList()
+        self.convs2 = ModuleList()
+        self.convs1on1 = ModuleList()
         self.lns = ModuleList()
         filters = input_dim[c_axis]
         while not dims.curr_size() == [1, 1]:
             filters = filters * 2
-            conv, dims = new_conv2d(dims, filters)
-            self.convs.append(conv)
+            indim = copy.copy(dims)
+            conv1, dims = new_conv2d(dims, filters)
+            conv2, dims = new_conv2d(dims, filters)
+            self.convs1.append(conv1)
+            self.convs2.append(conv2)
             ln = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
             self.lns.append(ln)
+            dims.update_dims(CatTransformer([dims, indim], cat_dim=c_axis))
+            conv1on1, dims = new_conv2d(dims, filters, kernel_size=(1, 1))
+            self.convs1on1.append(conv1on1)
             # do maxpool
             dims.update_dims(DimsTransformer(
                 size_transform=lambda x: [x[0] // 2, x[1] // 2]))
@@ -208,10 +221,20 @@ class criticBlock(torch.nn.Module):
 
     def forward(self, inputs):
         x = inputs
-        conv_iter = iter(self.convs)
+        conv1_iter = iter(self.convs1)
+        conv2_iter = iter(self.convs2)
+        conv1on1_iter = iter(self.convs1on1)
         ln_iter = iter(self.lns)
-        for conv, ln in itertools.zip_longest(conv_iter, ln_iter):
-            x = conv(x)
+        for conv1, conv2, conv1on1, ln in itertools.zip_longest(conv1_iter, conv2_iter, conv1on1_iter, ln_iter):
+            inx = torch.clone(x)
+            x = conv1(x)
+            torch.nn.ReLU(inplace=True)(x)  # save some memory
+            x = ln(x)
+            x = conv2(x)
+            torch.nn.ReLU(inplace=True)(x)  # save some memory
+            x = ln(x)
+            x = torch.cat([x, inx], dim=self.c_axis)
+            x = conv1on1(x)
             torch.nn.ReLU(inplace=True)(x)  # save some memory
             x = ln(x)
             x = torch.nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))(x)
