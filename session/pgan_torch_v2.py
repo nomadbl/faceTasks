@@ -189,12 +189,14 @@ def new_linear(curr_dims: DimsTracker, units):
 
 
 class criticBlock(torch.nn.Module):
-    def __init__(self, input_dim: list, filters, c_axis=C_AXIS):
+    def __init__(self, input_dim: list, c_axis=C_AXIS):
         super(criticBlock, self).__init__()
         dims = DimsTracker(input_dim)
         self.convs = ModuleList()
         self.lns = ModuleList()
+        filters = input_dim[c_axis]
         while not dims.curr_size() == [1, 1]:
+            filters = filters * 2
             conv, dims = new_conv2d(dims, filters)
             self.convs.append(conv)
             ln = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
@@ -245,7 +247,7 @@ class EncoderBlock(torch.nn.Module):
         self.coder_layer, dims = new_conv2d(
             dims, filters=code_features, kernel_size=(1, 1))
         self.code_shape = copy.copy(dims)
-        self.critic = criticBlock(conv3dims.curr_dim, filters // 2)
+        self.critic = criticBlock(conv3dims.curr_dim, c_axis=c_axis)
 
     def forward(self, inputs):
         x, x_prev = inputs
@@ -679,10 +681,7 @@ class stageGAN:
         cp_dict = {
             'epoch': epoch,
             'generator_state_dict': self.generator.state_dict(),
-            'coder_state_dict': self.coder.state_dict(),
-            'critic_head_state_dict': self.criticHead.state_dict(),
-            'coder_head_state_dict': self.coderHead.state_dict(),
-            'q_optimizer_state_dict': self.q_optimizer.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
             'd_optimizer_state_dict': self.d_optimizer.state_dict(),
             'g_optimizer_state_dict': self.g_optimizer.state_dict(),
             'image_shape': self.image_shape
@@ -830,7 +829,12 @@ class stageGAN:
             code_prediction = code_prediction[:batch_size]
             wgan_loss = torch.mean(labels * criticism)
 
-            random_code = random_latent_vectors[:, :, :, :self.code_features]
+            if C_AXIS == 1:
+                random_code = random_latent_vectors[:,
+                                                    :self.code_features, :, :]
+            else:
+                random_code = random_latent_vectors[:,
+                                                    :, :, :self.code_features]
             info_loss = torch.mean(torch.square(code_prediction - random_code))
 
             real_criticism_mean = torch.mean(criticism[batch_size:])

@@ -157,7 +157,7 @@ def main_gan_v2(station, max_image_shape, cp_dir=None, lr=0.001, batch_size=None
     noise_features = latent_features - code_features
     gan = stageGAN(files_dir=files_dir,
                    code_features_per_stage=code_features, noise_features=noise_features,
-                   decoder_filters_list=[512, 256, 128, 64, 32, 16],
+                   decoder_filters_list=[64, 64, 64, 64, 32, 16],
                    cp_dir=cp_dir,
                    epochs_per_phase=100,
                    info_lambda=0.01,
