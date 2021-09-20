@@ -201,21 +201,31 @@ class criticBlock(torch.nn.Module):
         self.convs1 = ModuleList()
         self.convs2 = ModuleList()
         self.convs1on1 = ModuleList()
-        self.lns = ModuleList()
+        self.lns1 = ModuleList()
+        self.lns2 = ModuleList()
+        self.lns3 = ModuleList()
         filters = input_dim[c_axis]
         linear_in_features = functools.reduce(operator.mul, input_dim[1:])
         while not dims.curr_size() == [2, 2]:
             filters = filters * 2
             indim = copy.copy(dims)
+
             conv1, dims = new_conv2d(dims, filters)
-            conv2, dims = new_conv2d(dims, filters)
             self.convs1.append(conv1)
+            ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+            self.lns1.append(ln1)
+
+            conv2, dims = new_conv2d(dims, filters)
             self.convs2.append(conv2)
-            ln = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
-            self.lns.append(ln)
+            ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+            self.lns2.append(ln2)
+
             dims.update_dims(CatTransformer([dims, indim], cat_dim=c_axis))
             conv1on1, dims = new_conv2d(dims, filters, kernel_size=(1, 1))
             self.convs1on1.append(conv1on1)
+            ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+            self.lns3.append(ln3)
+
             # do maxpool
             dims.update_dims(DimsTransformer(
                 size_transform=lambda x: [x[0] // 2, x[1] // 2]))
@@ -229,19 +239,21 @@ class criticBlock(torch.nn.Module):
         conv1_iter = iter(self.convs1)
         conv2_iter = iter(self.convs2)
         conv1on1_iter = iter(self.convs1on1)
-        ln_iter = iter(self.lns)
-        for conv1, conv2, conv1on1, ln in itertools.zip_longest(conv1_iter, conv2_iter, conv1on1_iter, ln_iter):
+        ln1_iter = iter(self.lns1)
+        ln2_iter = iter(self.lns2)
+        ln3_iter = iter(self.lns3)
+        for conv1, conv2, conv1on1, ln1, ln2, ln3 in itertools.zip_longest(conv1_iter, conv2_iter, conv1on1_iter, ln1_iter, ln2_iter, ln3_iter):
             inx = torch.clone(x)
             x = conv1(x)
+            x = ln1(x)
             torch.nn.ReLU(inplace=True)(x)  # save some memory
-            x = ln(x)
             x = conv2(x)
+            x = ln2(x)
             torch.nn.ReLU(inplace=True)(x)  # save some memory
-            x = ln(x)
             x = torch.cat([x, inx], dim=self.c_axis)
             x = conv1on1(x)
+            x = ln3(x)
             torch.nn.ReLU(inplace=True)(x)  # save some memory
-            x = ln(x)
             x = torch.nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))(x)
         x = torch.flatten(x, start_dim=1)
         criticism = self.linear(x)
@@ -280,16 +292,16 @@ class EncoderBlock(torch.nn.Module):
     def forward(self, inputs):
         x, x_prev = inputs
         x = self.conv1(x)  # output_dim_pre_concat
-        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
         x = self.ln1(x)
-        x = self.conv2(x)
         x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
+        x = self.conv2(x)
         x = self.ln2(x)
+        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
         # skip connection
         x = torch.cat([x, x_prev], dim=C_AXIS)
         x = self.conv3(x)
-        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
         x = self.ln3(x)
+        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
         code = self.coder_layer(x)
         code = torch.nn.LeakyReLU(negative_slope=0.1)(code)
         criticism = self.critic(x)
@@ -301,34 +313,55 @@ class GeneratorBlock(torch.nn.Module):
         super(GeneratorBlock, self).__init__()
         self.c_axis = c_axis
         dims = DimsTracker(input_dim)
+
         skip_dims = copy.copy(dims)
         skip_dims.update_dims(transform=DimsTransformer(
-            size_transform=lambda x: [x[0] * 2, x[1] * 2]))
-        self.conv1, dims = new_conv_trans2d(
-            dims, filters=filters)  # doubles input size
+            size_transform=lambda x: [x[0] * 2, x[1] * 2],
+            channels_transform=lambda x: 3))
+
+        # mix code and image with 1x1 conv
+        self.code_mix_conv, dims = new_conv2d(
+            dims, filters=dims.curr_channels(), kernel_size=(1, 1))
+        # doubles input size
+        self.conv1, dims = new_conv_trans2d(dims, filters=filters)
         self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+        # conv
         self.conv2, dims = new_conv2d(curr_dims=dims, filters=filters * 2)
         self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
-        self.conv3, dims = new_conv2d(curr_dims=dims, filters=filters * 4)
+        # reduce number of features
+        self.conv3, dims = new_conv2d(
+            curr_dims=dims, filters=3, kernel_size=(1, 1))
         self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+        # concat skip connection
         dims.update_dims(CatTransformer([dims, skip_dims], cat_dim=c_axis))
+        # produce image
         self.to_rgb, dims = new_conv2d(
             curr_dims=dims, filters=3, kernel_size=(1, 1))
 
         self.out_dims = dims
 
     def forward(self, inputs):
-        x = torch.nn.UpsamplingBilinear2d(scale_factor=2)(inputs)
-        y = self.conv1(inputs)
-        y = torch.nn.ReLU()(y)
+        # upsample image
+        if self.c_axis == 1:
+            prev_image = inputs[:, :3, :, :]
+        else:
+            prev_image = inputs[:, :, :, :3]
+        x = torch.nn.UpsamplingBilinear2d(scale_factor=2)(prev_image)
+        # main branch
+        y = self.code_mix_conv(inputs)
+        torch.nn.ReLU(inplace=True)(y)
+        y = self.conv1(y)
         y = self.ln1(y)
+        torch.nn.ReLU(inplace=True)(y)
         y = self.conv2(y)
-        y = torch.nn.ReLU()(y)
         y = self.ln2(y)
+        torch.nn.ReLU(inplace=True)(y)
         y = self.conv3(y)
-        y = torch.nn.ReLU()(y)
         y = self.ln3(y)
-        y = torch.cat([x, y], dim=self.c_axis)  # skip connection
+        torch.nn.ReLU(inplace=True)(y)
+        # skip connection
+        y = torch.cat([x, y], dim=self.c_axis)
+        # create image
         y = self.to_rgb(y)
         y = torch.tanh(y)  # range [-1, 1]
         y = torch.mul(y, 1/2)  # range [-1/2, 1/2]
@@ -691,10 +724,10 @@ class stageGAN:
                         it = iter(eval_loader)
                         for step in range(test_steps):
                             images = next(it)
-                            images[0] = images[0].to(self.device)
-                            images[1] = images[1].to(self.device)
+                            curr_images = images[0].to(self.device)
+                            prev_images = images[1].to(self.device)
                             eval_losses, eval_metrics = self.test_step(
-                                images)
+                                [curr_images, prev_images])
                             for scalar, value in chain(iter(eval_losses.items()), iter(eval_metrics.items())):
                                 if scalar not in eval_running.keys():
                                     eval_running[scalar] = 0.0
@@ -813,34 +846,36 @@ class stageGAN:
             info_lambda, dtype=torch.float32, device=self.device)
 
     def test_step(self, images):
+        prev_images = images[1]
+        curr_images = images[0]
         with torch.no_grad():
             # Sample random points in the latent space
-            batch_size = images[0].shape[0]
+            batch_size = curr_images.shape[0]
             channels = self.code_features + self.noise_features
             if C_AXIS == 1:
-                size = [images[1].shape[2], images[1].shape[3]]
+                size = [prev_images.shape[2], prev_images.shape[3]]
                 latent_shape = [batch_size, channels, *size]
             else:
-                size = [images[1].shape[1], images[1].shape[2]]
+                size = [prev_images.shape[1], prev_images.shape[2]]
                 latent_shape = [batch_size, *size, channels]
             random_latent_vectors = torch.randn(
                 size=latent_shape, device=self.device)
             coded_prev_image = torch.cat(
-                [images[1], random_latent_vectors], dim=C_AXIS)
+                [prev_images, random_latent_vectors], dim=C_AXIS)
             # Decode them to fake images
             generated_images = self.generator(coded_prev_image)
 
             # gradient penalty
             eps = torch.rand([batch_size, 1, 1, 1],
                              dtype=torch.float32, device=self.device)
-            interp_images = torch.mul(eps, images[0]) + \
+            interp_images = torch.mul(eps, curr_images) + \
                 torch.mul((1 - eps), generated_images)
 
         interp_images.requires_grad = True
 
         for param in self.critic.parameters():
             param.requires_grad = False
-        _, interp_criticism = self.critic([interp_images, images[1]])
+        _, interp_criticism = self.critic([interp_images, prev_images])
         interp_criticism = interp_criticism.sum()
         critic_x_grad = torch.autograd.grad(
             interp_criticism, interp_images, create_graph=True)
@@ -853,8 +888,8 @@ class stageGAN:
 
         with torch.no_grad():
             # Combine them with real images
-            combined_images = torch.cat([generated_images, images[0]], dim=0)
-            combined_prev_images = torch.cat([images[1], images[1]], dim=0)
+            combined_images = torch.cat([generated_images, curr_images], dim=0)
+            combined_prev_images = torch.cat([prev_images, prev_images], dim=0)
 
             # Assemble labels discriminating real from fake images
             labels = torch.cat([self.fake_label * torch.ones((batch_size, 1), dtype=torch.float32, device=self.device),
@@ -919,30 +954,33 @@ class stageGAN:
 
     def train_step(self, images):
         # Sample random points in the latent space
-        batch_size = images[0].shape[0]
+        curr_images = images[0]
+        prev_images = images[1]
+        batch_size = curr_images.shape[0]
+
         channels = self.code_features + self.noise_features
         if C_AXIS == 1:
-            size = [images[1].shape[2], images[1].shape[3]]
+            size = [prev_images.shape[2], prev_images.shape[3]]
             latent_shape = [batch_size, channels, *size]
         else:
-            size = [images[1].shape[1], images[1].shape[2]]
+            size = [prev_images.shape[1], prev_images.shape[2]]
             latent_shape = [batch_size, *size, channels]
         random_latent_vectors = torch.randn(
             size=latent_shape, device=self.device)
 
         if self.image_shape == (4, 4):
             generator_input = torch.cat(
-                [torch.zeros_like(images[1]), random_latent_vectors], dim=C_AXIS)
+                [torch.zeros_like(prev_images), random_latent_vectors], dim=C_AXIS)
         else:
             generator_input = torch.cat(
-                [images[1], random_latent_vectors], dim=C_AXIS)
+                [prev_images, random_latent_vectors], dim=C_AXIS)
         # Decode them to fake images
         with torch.no_grad():
             generated_images = self.generator(generator_input)
 
         # Combine them with real images
-        combined_images = torch.cat([generated_images, images[0]], dim=0)
-        combined_prev_images = torch.cat([images[1], images[1]], dim=0)
+        combined_images = torch.cat([generated_images, curr_images], dim=0)
+        combined_prev_images = torch.cat([prev_images, prev_images], dim=0)
 
         # Assemble labels discriminating real from fake images
         labels = torch.cat([self.fake_label * torch.ones([batch_size, 1], device=self.device),
@@ -954,7 +992,7 @@ class stageGAN:
         for step in range(5):
             # generate random "intermediate" images interpolating the generated and real images for gradient penalty
             eps = torch.rand(size=[batch_size, 1, 1, 1], device=self.device)
-            interp_images = torch.mul(eps, images[0]) + \
+            interp_images = torch.mul(eps, curr_images) + \
                 torch.mul((1 - eps), generated_images)
             interp_images.requires_grad = True
 
@@ -962,7 +1000,7 @@ class stageGAN:
                 [combined_images, combined_prev_images])
             wgan_loss = torch.mean(torch.mul(labels, criticism))
 
-            _, interp_criticism = self.critic([interp_images, images[1]])
+            _, interp_criticism = self.critic([interp_images, prev_images])
             interp_criticism = interp_criticism.sum()
             critic_x_grad = torch.autograd.grad(
                 interp_criticism, interp_images, create_graph=True)
@@ -1004,10 +1042,10 @@ class stageGAN:
 
         if self.image_shape == (4, 4):
             generator_input = torch.cat(
-                [torch.zeros_like(images[1]), random_latent_vectors], dim=C_AXIS)
+                [torch.zeros_like(prev_images), random_latent_vectors], dim=C_AXIS)
         else:
             generator_input = torch.cat(
-                [images[1], random_latent_vectors], dim=C_AXIS)
+                [prev_images, random_latent_vectors], dim=C_AXIS)
         # Assemble labels that say "all real images"
         # This makes the generator want to create real images (match the label) since
         # we do not include an additional minus in the loss
@@ -1020,7 +1058,8 @@ class stageGAN:
 
         for param in self.critic.critic_params_iter():
             param.requires_grad = False
-        code_prediction, fake_criticism = self.critic([fake_images, images[1]])
+        code_prediction, fake_criticism = self.critic(
+            [fake_images, prev_images])
         for param in self.critic.critic_params_iter():
             param.requires_grad = True
         g_loss = torch.mean(misleading_labels * fake_criticism)
