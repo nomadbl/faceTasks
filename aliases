@@ -1,0 +1,8 @@
+
+#My custom aliases
+alias tb="tensorboard --logdir session/ --port=6006 &"
+alias train="nohup python3 session/facial_segmentation_torch_main.py --v 3 --station aws --gc --agc --bs 512 > run_out &"
+alias disp="tail -f run_out"
+alias backup="rm session.zip && zip -r session.zip session/"
+alias stopall="ps aux | grep python | awk '{print $2}' | xargs -I {} kill -9 {}"
+alias source_torch="source activate pytorch_latest_p37"
