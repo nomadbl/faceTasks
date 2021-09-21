@@ -275,35 +275,30 @@ class EncoderBlock(torch.nn.Module):
             size_transform=lambda x: [x[0] // 2, x[1] // 2]))
         self.conv1, dims = new_conv2d(dims, filters=filters)
         self.ln1 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
-        self.conv2, dims = new_conv2d(dims, filters=filters, stride=(
+        self.conv2, dims = new_conv2d(dims, filters=filters * 2, stride=(
             2, 2), padding=(1, 1))  # output image size halved
         self.ln2 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
         # cat here
         dims.update_dims(transform=CatTransformer(
             [dims, conditional_dim], cat_dim=c_axis))
-        self.conv3, dims = new_conv2d(dims, filters=filters)
-        conv3dims = copy.copy(dims)
-        self.ln3 = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+
+        self.critic = criticBlock(dims.curr_dim, c_axis=c_axis)
         self.coder_layer, dims = new_conv2d(
             dims, filters=code_features, kernel_size=(1, 1))
         self.code_shape = copy.copy(dims)
-        self.critic = criticBlock(conv3dims.curr_dim, c_axis=c_axis)
 
     def forward(self, inputs):
         x, x_prev = inputs
-        x = self.conv1(x)  # output_dim_pre_concat
+        x = self.conv1(x)
         x = self.ln1(x)
-        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
+        torch.nn.LeakyReLU(negative_slope=0.1, inplace=True)(x)
         x = self.conv2(x)
         x = self.ln2(x)
-        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
+        torch.nn.LeakyReLU(negative_slope=0.1, inplace=True)(x)
         # skip connection
         x = torch.cat([x, x_prev], dim=C_AXIS)
-        x = self.conv3(x)
-        x = self.ln3(x)
-        x = torch.nn.LeakyReLU(negative_slope=0.1)(x)
         code = self.coder_layer(x)
-        code = torch.nn.LeakyReLU(negative_slope=0.1)(code)
+        torch.nn.LeakyReLU(negative_slope=0.1, inplace=True)(code)
         criticism = self.critic(x)
         return code, criticism
 
@@ -408,11 +403,6 @@ class Generator(torch.nn.Module):
             dims.update_dims(
                 transform=DimsTransformer(channels_transform=lambda x: self.channels))
 
-        # only train last (most recent) block
-        for i in range(len(current_decoder_inputs)-1):
-            for param in self.generator_blocks[i].parameters():
-                param.requires_grad = False
-
         print("\n")
         if eval_model:
             self.eval()
@@ -485,16 +475,20 @@ class Critic(torch.nn.Module):
         self.code_shape = self.encoder_blocks[index].code_shape
 
     # get an iterator for coder parameters
-    def coder_params_iter(self):
+    def coder_params_iter(self, names=False):
         filtered = filter(lambda x: "coder_layer" in x[0],
                           self.named_parameters())
+        if names:
+            return filtered
         params_iter = map(lambda x: x[1], filtered)
         return params_iter
 
     # get an iterator for all non coder parameters
-    def critic_params_iter(self):
+    def critic_params_iter(self, names=False):
         filtered = itertools.filterfalse(lambda x: "coder_layer" in x[0],
                                          self.named_parameters())
+        if names:
+            return filtered
         params_iter = map(lambda x: x[1], filtered)
         return params_iter
 
@@ -518,12 +512,16 @@ class Critic(torch.nn.Module):
 
 
 class FacesDataset(Dataset):
-    def __init__(self, files, start_size=(4, 4), size=(128, 128)):
+    def __init__(self, files, start_size=(4, 4), size=(128, 128), on_gpu=False):
         self.files = files
         self.ln = len(files)
         self.size = size
         self.prev_size = (size[0] // 2, size[1] // 2)
         self.start_size = start_size
+        if on_gpu and torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
 
     def update_size(self, size):
         self.prev_size = (size[0] // 2, size[1] // 2)
@@ -532,7 +530,7 @@ class FacesDataset(Dataset):
     def __getitem__(self, item):
         file = self.files[item]
         file = torchvision.io.read_file(file)
-        image = torchvision.io.decode_jpeg(file)
+        image = torchvision.io.decode_jpeg(file, device=self.device)
         image = torchvision.transforms.Resize(size=self.size)(image)
         if self.prev_size is not self.start_size:
             prev_image = torchvision.transforms.Resize(
@@ -583,6 +581,7 @@ class stageGAN:
             self.training_indices[tmp_image_shape] = ind
             tmp_image_shape = (
                 2 * tmp_image_shape[0], 2 * tmp_image_shape[1])
+            ind += 1
 
         self.cp_dir = cp_dir
         if not os.path.exists(cp_dir):
@@ -648,8 +647,10 @@ class stageGAN:
         train_samples = int(round(image_count * train_percent))
         train_files = files[:train_samples]
         val_files = files[train_samples:]
-        train_dataset = FacesDataset(train_files, size=self.image_shape)
-        val_dataset = FacesDataset(val_files, size=self.image_shape)
+        train_dataset = FacesDataset(
+            train_files, size=self.image_shape, on_gpu=True)
+        val_dataset = FacesDataset(
+            val_files, size=self.image_shape, on_gpu=True)
         return train_dataset, val_dataset
 
     def fit(self):
@@ -672,8 +673,7 @@ class stageGAN:
             batchl_size = self.batch_sizes[self.image_shape]
             self.build_models(batchl_size, eval_model=False)
 
-            self.compile(d_optimizer=torch.optim.Adam(self.critic.critic_params_iter(),
-                                                      lr=self.lr),
+            self.compile(d_optimizer=torch.optim.Adam(self.critic.critic_params_iter(), lr=self.lr),
                          g_optimizer=torch.optim.Adam(
                              chain(self.generator.parameters(), self.critic.coder_params_iter()), lr=self.lr),
                          grad_lambda=10, info_lambda=0.01)
@@ -697,8 +697,8 @@ class stageGAN:
                 progress_bar.set_description(description)
                 i = 0
                 for batch in progress_bar:
-                    batch[0] = batch[0].to(self.device)
-                    batch[1] = batch[1].to(self.device)
+                    # batch[0] = batch[0].to(self.device)
+                    # batch[1] = batch[1].to(self.device)
                     losses, metrics = self.train_step(batch)
 
                     global_step = epoch * n_total_steps + i
@@ -724,10 +724,9 @@ class stageGAN:
                         it = iter(eval_loader)
                         for step in range(test_steps):
                             images = next(it)
-                            curr_images = images[0].to(self.device)
-                            prev_images = images[1].to(self.device)
-                            eval_losses, eval_metrics = self.test_step(
-                                [curr_images, prev_images])
+                            # curr_images = images[0].to(self.device)
+                            # prev_images = images[1].to(self.device)
+                            eval_losses, eval_metrics = self.test_step(images)
                             for scalar, value in chain(iter(eval_losses.items()), iter(eval_metrics.items())):
                                 if scalar not in eval_running.keys():
                                     eval_running[scalar] = 0.0
@@ -822,10 +821,10 @@ class stageGAN:
                                     [0] * 2, checkpoint['image_shape'][0] * 2)
             else:
                 self.image_shape = checkpoint['image_shape']
-            if self.image_shape[0] > self.max_image_shape:
+            if self.image_shape[0] > self.final_image_shape[0]:
 
                 print(
-                    f"Finished training max image resolution [{self.max_image_shape},{self.max_image_shape}]. Done training")
+                    f"Finished training max image resolution [{self.final_image_shape},{self.final_image_shape}]. Done training")
                 return True
             print(f"Found checkpoint. Starting image shape={self.image_shape}")
         else:
@@ -1017,10 +1016,15 @@ class stageGAN:
                 for param in self.critic.critic_params_iter():
                     param.grad = self.get_clipped_grad(param)
             self.d_optimizer.step()
+            # debug
+            critic_params = [
+                param for param in self.critic.critic_params_iter()]
+            ##
             self.d_optimizer.zero_grad()
 
             interp_images.grad.zero_()
             critic_x_grad.zero_()
+
         with torch.no_grad():
             real_criticism_mean = torch.mean(criticism[batch_size:])
             fake_criticism_mean = torch.mean(criticism[:batch_size])
@@ -1066,6 +1070,7 @@ class stageGAN:
         info_loss = torch.mean(torch.square(code_prediction - random_code))
         total_g_loss = g_loss + self.info_lambda * info_loss
         total_g_loss.backward()
+
         if self.gradient_centralization:
             for param in chain(self.generator.parameters(), self.critic.coder_params_iter()):
                 param.grad = self.centralized_grad(param)
@@ -1073,7 +1078,12 @@ class stageGAN:
             for param in chain(self.generator.parameters(), self.critic.coder_params_iter()):
                 param.grad = self.get_clipped_grad(param)
 
+        # debug
+        gen_params = [
+            param for param in self.generator.parameters()]
+        ##
         self.g_optimizer.step()
+
         self.g_optimizer.zero_grad()
 
         losses = {"critic_loss": -wgan_loss,
