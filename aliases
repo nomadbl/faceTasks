@@ -6,5 +6,5 @@ alias resume="nohup python3 session/facial_segmentation_torch_main.py --v 3 --st
 alias next="nohup python3 session/facial_segmentation_torch_main.py --v 3 --station aws --gc --agc --bs 512 --c ~/session/run_1 --next > run_out &"
 alias disp="tail -f run_out"
 alias backup="rm session.zip && zip -r session.zip session/"
-alias stopall="ps aux | grep python | awk '{print "$2"}' | xargs -I {} kill -9 {}"
+alias stopall="ps aux | grep python | awk '{print $2}' | xargs -I {} kill -9 {}"
 alias source_torch="source activate pytorch_latest_p37"

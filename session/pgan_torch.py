@@ -1,8 +1,6 @@
 import os
 import copy
 import glob
-from typing import Iterable
-from torch._C import device, dtype
 from torch.autograd import grad
 from tqdm import tqdm
 from itertools import chain

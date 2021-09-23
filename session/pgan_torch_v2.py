@@ -189,13 +189,37 @@ def new_linear(curr_dims: DimsTracker, units):
     return linear, curr_dims
 
 
-class criticBlock(torch.nn.Module):
+class PatchCriticBlock(torch.nn.Module):
     """
     res net architecture for identifying real vs fake conditional distribution
     """
 
     def __init__(self, input_dim: list, c_axis=C_AXIS):
-        super(criticBlock, self).__init__()
+        super(PatchCriticBlock, self).__init__()
+        self.c_axis = c_axis
+        dims = DimsTracker(input_dim)
+        conv, dims = new_conv2d(dims, filters=1)
+        self.conv = conv
+        self.ln = torch.nn.LayerNorm(normalized_shape=dims.curr_dim[1:])
+        # self.mp = torch.nn.MaxPool2d(kernel_size=tuple(dims.curr_size())) # seems to make things worse (?) # run 2
+
+    def forward(self, inputs):
+        x = inputs
+        x = self.conv(x)
+        x = self.ln(x)
+        # criticism = self.mp(x) # run 2
+        criticism = torch.mean(x, dim=(2, 3))  # run 3
+        # criticism = torch.flatten(criticism, start_dim=1) # run 2
+        return criticism
+
+
+class CriticBlock(torch.nn.Module):  # run 1 - slow as hell
+    """
+    res net architecture for identifying real vs fake conditional distribution
+    """
+
+    def __init__(self, input_dim: list, c_axis=C_AXIS):
+        super(CriticBlock, self).__init__()
         self.c_axis = c_axis
         dims = DimsTracker(input_dim)
         self.convs1 = ModuleList()
@@ -282,7 +306,7 @@ class EncoderBlock(torch.nn.Module):
         dims.update_dims(transform=CatTransformer(
             [dims, conditional_dim], cat_dim=c_axis))
 
-        self.critic = criticBlock(dims.curr_dim, c_axis=c_axis)
+        self.critic = PatchCriticBlock(dims.curr_dim, c_axis=c_axis)
         self.coder_layer, dims = new_conv2d(
             dims, filters=code_features, kernel_size=(1, 1))
         self.code_shape = copy.copy(dims)
@@ -512,16 +536,12 @@ class Critic(torch.nn.Module):
 
 
 class FacesDataset(Dataset):
-    def __init__(self, files, start_size=(4, 4), size=(128, 128), on_gpu=False):
+    def __init__(self, files, start_size=(4, 4), size=(128, 128)):
         self.files = files
         self.ln = len(files)
         self.size = size
         self.prev_size = (size[0] // 2, size[1] // 2)
         self.start_size = start_size
-        if on_gpu and torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
 
     def update_size(self, size):
         self.prev_size = (size[0] // 2, size[1] // 2)
@@ -530,7 +550,7 @@ class FacesDataset(Dataset):
     def __getitem__(self, item):
         file = self.files[item]
         file = torchvision.io.read_file(file)
-        image = torchvision.io.decode_jpeg(file, device=self.device)
+        image = torchvision.io.decode_jpeg(file)
         image = torchvision.transforms.Resize(size=self.size)(image)
         if self.prev_size is not self.start_size:
             prev_image = torchvision.transforms.Resize(
@@ -648,9 +668,9 @@ class stageGAN:
         train_files = files[:train_samples]
         val_files = files[train_samples:]
         train_dataset = FacesDataset(
-            train_files, size=self.image_shape, on_gpu=True)
+            train_files, size=self.image_shape)
         val_dataset = FacesDataset(
-            val_files, size=self.image_shape, on_gpu=True)
+            val_files, size=self.image_shape)
         return train_dataset, val_dataset
 
     def fit(self):
@@ -697,8 +717,8 @@ class stageGAN:
                 progress_bar.set_description(description)
                 i = 0
                 for batch in progress_bar:
-                    # batch[0] = batch[0].to(self.device)
-                    # batch[1] = batch[1].to(self.device)
+                    batch[0] = batch[0].to(self.device)
+                    batch[1] = batch[1].to(self.device)
                     losses, metrics = self.train_step(batch)
 
                     global_step = epoch * n_total_steps + i
@@ -724,9 +744,10 @@ class stageGAN:
                         it = iter(eval_loader)
                         for step in range(test_steps):
                             images = next(it)
-                            # curr_images = images[0].to(self.device)
-                            # prev_images = images[1].to(self.device)
-                            eval_losses, eval_metrics = self.test_step(images)
+                            test_images = [images[0].to(
+                                self.device), images[1].to(self.device)]
+                            eval_losses, eval_metrics = self.test_step(
+                                test_images)
                             for scalar, value in chain(iter(eval_losses.items()), iter(eval_metrics.items())):
                                 if scalar not in eval_running.keys():
                                     eval_running[scalar] = 0.0

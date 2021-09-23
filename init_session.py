@@ -2,8 +2,6 @@ import subprocess
 import sys
 import argparse
 
-from torch._C import AliasDb
-
 
 def init(args):
     addr = args.addr
@@ -16,12 +14,16 @@ def init(args):
 
     sshcmd = f"ssh -i ~/.ssh/lior.pem ec2-user@{addr}"
 
+    print("preparing session")
     if s3:
-        cmd = f'{sshcmd} "rm ~/session.zip && zip -r ~/session.zip ~/session/ && aws s3 cp s3://nomadblfaces/session session.zip"'
+        # get checkpoints etc from s3
+        cmd = f'{sshcmd} "aws s3 cp s3://nomadblfaces/session session.zip & unzip session.zip"'
         subprocess.run(cmd, shell=True)
-    else:
-        cmd = f"scp -i ~/.ssh/lior.pem session.zip ec2-user@{addr}:~/session.zip"
-        subprocess.run(cmd, shell=True)
+    # get latest version of python files from local machine
+    cmd = f"scp -i ~/.ssh/lior.pem session.zip ec2-user@{addr}:~/session.zip"
+    subprocess.run(cmd, shell=True)
+    cmd = f'{sshcmd} "yes A | unzip session.zip"'
+    subprocess.run(cmd, shell=True)
 
     print("Copy data from s3...")
     cmd = f'{sshcmd} "aws s3 cp s3://nomadblfaces/data data.zip; unzip data.zip"'
@@ -73,6 +75,7 @@ def upload(args):
     print(f"uploading {file}")
     file_target = "~/session/"+file.split(sep='/')[-1]
     cmd = f"scp -i ~/.ssh/lior.pem {file} ec2-user@{addr}:{file_target}"
+    print(cmd)
     subprocess.run(cmd, shell=True)
 
 
@@ -102,7 +105,7 @@ if __name__ == "__main__":
 
     init_parser.add_argument(dest="addr", type=str,
                              help="ec2 instance ipv4 address")
-    init_parser.add_argument("--s3", dest="s3", type=str,
+    init_parser.add_argument("--s3", dest="s3", action="store_true",
                              help="get session from s3")
     init_parser.set_defaults(func=init)
     connect_parser.add_argument(
