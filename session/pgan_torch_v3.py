@@ -962,9 +962,9 @@ class AdaptiveStageGAN:
 
         # update gan architecture
         train_change = abs(
-            running["critic_loss"] - prev_running["critic_loss"]) / running["critic_loss"]
+            running["critic_loss"] - prev_running["critic_loss"]) / abs(running["critic_loss"])
         bias = abs(
-            eval_running["critic_loss"] - running["critic_loss"]) / eval_running["critic_loss"]
+            eval_running["critic_loss"] - running["critic_loss"]) / abs(eval_running["critic_loss"])
         if bias > 0.1:
             # revert to previous unbiased model
             self.load_cp(get_specs=True, get_backup=True)
