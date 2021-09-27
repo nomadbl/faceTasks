@@ -954,6 +954,7 @@ class AdaptiveStageGAN:
         self.q_optimizer.state = opt_state
 
     def update_architecture(self, epoch, losses, running, prev_running, eval_running):
+        epoch, losses, running, prev_running, eval_running
         # update architecture of models if test and train loss are not too far apart
         # and loss does not change within tolerance
         if prev_running is None:
@@ -961,9 +962,9 @@ class AdaptiveStageGAN:
 
         # update gan architecture
         train_change = abs(
-            running["wgan_loss"] - prev_running["wgan_loss"]) / running["wgan_loss"]
+            running["critic_loss"] - prev_running["critic_loss"]) / running["critic_loss"]
         bias = abs(
-            eval_running["wgan_loss"] - running["wgan_loss"]) / eval_running["wgan_loss"]
+            eval_running["critic_loss"] - running["critic_loss"]) / eval_running["critic_loss"]
         if bias > 0.1:
             # revert to previous unbiased model
             self.load_cp(get_specs=True, get_backup=True)
@@ -994,9 +995,9 @@ class AdaptiveStageGAN:
 
         # update coder architecture
         train_change = abs(
-            running["info_loss"] - prev_running["info_loss"]) / running["info_loss"]
+            running["info_loss"] - prev_running["info_loss"]) / abs(running["info_loss"])
         bias = abs(
-            eval_running["info_loss"] - running["info_loss"]) / eval_running["info_loss"]
+            eval_running["info_loss"] - running["info_loss"]) / abs(eval_running["info_loss"])
         if bias > 0.1:
             # revert to previous unbiased model
             self.load_cp(get_specs=True, get_backup=True)
@@ -1067,7 +1068,7 @@ class AdaptiveStageGAN:
                 losses, metrics, running, eval_running = self.process_epoch(
                     train_ds, eval_ds, epoch)
                 success = self.update_architecture(
-                    self, epoch, losses, running, prev_running, eval_running)
+                    epoch, losses, running, prev_running, eval_running)
                 if not success:
                     break
 
@@ -1259,6 +1260,7 @@ class AdaptiveStageGAN:
             labels = torch.cat([self.fake_label * torch.ones((batch_size, 1), dtype=torch.float32, device=self.device),
                                 self.real_label * torch.ones((batch_size, 1), dtype=torch.float32, device=self.device)],
                                dim=0)
+            labels = labels.reshape([2*batch_size, 1, 1, 1])
 
             criticism = self.critics(
                 [combined_images, combined_prev_images])
@@ -1351,10 +1353,11 @@ class AdaptiveStageGAN:
         # Assemble labels discriminating real from fake images
         labels = torch.cat([self.fake_label * torch.ones([batch_size, 1], device=self.device),
                             self.real_label * torch.ones([batch_size, 1], device=self.device)], dim=0)
+        labels = labels.reshape([2*batch_size, 1, 1, 1])
 
         # Train the discriminator to optimality
-        wgan_loss = torch.tensor(0, dtype=torch.float32, device=self.device)
-        penalty_loss = torch.tensor(0, dtype=torch.float32, device=self.device)
+        # wgan_loss = torch.tensor(0, dtype=torch.float32, device=self.device)
+        # penalty_loss = torch.tensor(0, dtype=torch.float32, device=self.device)
         for step in range(5):
             # generate random "intermediate" images interpolating the generated and real images for gradient penalty
             eps = torch.rand(size=[batch_size, 1, 1, 1], device=self.device)
@@ -1417,7 +1420,7 @@ class AdaptiveStageGAN:
         # This makes the generators want to create real images (match the label) since
         # we do not include an additional minus in the loss
         misleading_labels = self.real_label * \
-            torch.ones([batch_size, 1], device=self.device)
+            torch.ones([batch_size, 1, 1, 1], device=self.device)
 
         # Train the generators and encoder(note that we should *not* update the weights
         # of the critics)!

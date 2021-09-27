@@ -1,5 +1,4 @@
 import subprocess
-import sys
 import argparse
 
 
@@ -13,6 +12,10 @@ def init(args):
     subprocess.run(cmd, shell=True)
 
     sshcmd = f"ssh -i ~/.ssh/lior.pem ec2-user@{addr}"
+
+    # get images from s3
+    cmd = f'{sshcmd} "aws s3 cp s3://nomadblfaces/data data.zip & unzip data.zip"'
+    subprocess.run(cmd, shell=True)
 
     print("preparing session")
     if s3:
