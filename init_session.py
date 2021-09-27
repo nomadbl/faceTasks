@@ -25,11 +25,6 @@ def init(args):
     cmd = f'{sshcmd} "yes A | unzip session.zip"'
     subprocess.run(cmd, shell=True)
 
-    print("Copy data from s3...")
-    cmd = f'{sshcmd} "aws s3 cp s3://nomadblfaces/data data.zip; unzip data.zip"'
-    # print(cmd)
-    subprocess.run(cmd, shell=True)
-
     print("Copied data from s3")
     print("unpacking session")
     cmd = f'{sshcmd} "unzip session.zip"'
