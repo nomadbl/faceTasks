@@ -229,7 +229,7 @@ class ResnextBlock(torch.nn.Module):
         increase the cardinality of this resnet block
         This is implemented for adaptive training where we increase the cardinality gradually
         """
-        self.branches.add_module(ResnextBranch(
+        self.branches.append(ResnextBranch(
             self.in_shape, self.filters, activation=self.activation, c_axis=self.c_axis))
         self.branch_weights.append(torch.nn.parameter.Parameter(
             torch.tensor(0, dtype=torch.float32), requires_grad=True))
@@ -239,8 +239,17 @@ class ResnextBlock(torch.nn.Module):
         Reduce the cardinality of this resnet block
         This is implemented for adaptive training where we increase the cardinality gradually
         """
-        self.branches = torch.nn.ModuleList(self.branches[:-1])
-        self.branch_weights = torch.nn.ParameterList(self.branch_weights[:-1])
+        def truncate(it, n):
+            cache = [next(it) for i in range(n)]
+            index = 0
+            for val in it:
+                yield cache[index]
+                cache[index] = val
+                index = (index + 1) % n
+        modules_gen = truncate(iter(self.branches), 1)
+        self.branches = torch.nn.ModuleList(iter(modules_gen))
+        weights_gen = truncate(iter(self.branch_weights), 1)
+        self.branch_weights = torch.nn.ParameterList(iter(weights_gen))
 
 
 class AdaptiveResnext(torch.nn.Module):
@@ -290,8 +299,8 @@ class AdaptiveResnext(torch.nn.Module):
         """
         self.out_factors.append(torch.nn.parameter.Parameter(
             torch.tensor(0, dtype=torch.float32), requires_grad=True))
-        self.blocks.add_module(ResnextBlock(
-            self.in_shape, filters, activation=self.activation, c_axis=self.c_axis))
+        self.blocks.append(ResnextBlock(
+            self.in_shape, self.filters, activation=self.activation, c_axis=self.c_axis))
         self.spec.append(1)
 
     def increase_cardinality(self):
@@ -515,6 +524,7 @@ class GeneratorCollection(torch.nn.Module):
         i = 0
         while size != final_image_shape:
             size = [size[0] * 2, size[1] * 2]
+            self.index_to_size.append(tuple(size))
             spec = None if specs is None else specs[tuple(size)]
             self.generators.append(
                 Generator(dims.curr_dim, filters=4, embedding_dim=embedding_dim, spec=spec))
@@ -824,6 +834,9 @@ class AdaptiveStageGAN:
         self.adaptive_gradient_clipping = adaptive_gradient_clipping
         self.gradient_centralization = gradient_centralization
 
+        self.updated_gan_cardinality_flag = False
+        self.updated_coder_cardinality_flag = False
+
         self.files_dir = files_dir
 
         self.device = torch.device(
@@ -852,6 +865,8 @@ class AdaptiveStageGAN:
                 self.training_indices[self.image_shape])
             self.coders.set_training_index(
                 self.training_indices[self.image_shape])
+        self.updated_gan_cardinality_flag = False
+        self.updated_coder_cardinality_flag = False
 
     def models_to_device(self):
         self.generators.to(self.device)
@@ -957,20 +972,19 @@ class AdaptiveStageGAN:
         epoch, losses, running, prev_running, eval_running
         # update architecture of models if test and train loss are not too far apart
         # and loss does not change within tolerance
+        any_change = False
         if prev_running is None:
             prev_running = {key: float("inf") for key in running}
 
         # update gan architecture
         train_change = abs(
             running["critic_loss"] - prev_running["critic_loss"]) / abs(running["critic_loss"])
-        bias = abs(
-            eval_running["critic_loss"] - running["critic_loss"]) / abs(eval_running["critic_loss"])
-        if bias > 0.1:
-            # revert to previous unbiased model
-            self.load_cp(get_specs=True, get_backup=True)
-            self.load_cp(get_backup=True)
-            # stop training
-            return False  # signal to stop iteration
+        # bias = abs(
+        #     eval_running["critic_loss"] - running["critic_loss"]) / abs(eval_running["critic_loss"])
+        # if bias > 0.1:
+        #     # revert to previous unbiased model
+        #     self.load_cp(get_specs=True, get_backup=True)
+        #     self.load_cp(get_backup=True)
         if train_change < 0.02 and self.updated_gan_cardinality_flag:
             # load with less cardinality since that did not help
             self.decrease_gan_cardinality()
@@ -981,7 +995,7 @@ class AdaptiveStageGAN:
             self.increase_gan_depth()
             self.specs["generator_specs"] = self.generators.get_specs()
             self.specs["critic_specs"] = self.critics.get_specs()
-            self.refresh_optimizers()
+            any_change = True
         elif train_change < 0.02:
             # update architecture, cardinality before depth
             self.save_cp(epoch, losses, backup=True)
@@ -989,21 +1003,19 @@ class AdaptiveStageGAN:
             self.specs["generator_specs"] = self.generators.get_specs()
             self.specs["critic_specs"] = self.critics.get_specs()
             self.updated_gan_cardinality_flag = True
-            self.refresh_optimizers()
+            any_change = True
         elif self.updated_gan_cardinality_flag:
             self.updated_gan_cardinality_flag = False
 
         # update coder architecture
         train_change = abs(
             running["info_loss"] - prev_running["info_loss"]) / abs(running["info_loss"])
-        bias = abs(
-            eval_running["info_loss"] - running["info_loss"]) / abs(eval_running["info_loss"])
-        if bias > 0.1:
-            # revert to previous unbiased model
-            self.load_cp(get_specs=True, get_backup=True)
-            self.load_cp(get_backup=True)
-            # stop training
-            return False  # signal to stop iteration
+        # bias = abs(
+        #     eval_running["info_loss"] - running["info_loss"]) / abs(eval_running["info_loss"])
+        # if bias > 0.1:
+        #     # revert to previous unbiased model
+        #     self.load_cp(get_specs=True, get_backup=True)
+        #     self.load_cp(get_backup=True)
         if train_change < 0.02 and self.updated_coder_cardinality_flag:
             # load with less cardinality since that did not help
             self.decrease_coder_cardinality()
@@ -1013,16 +1025,25 @@ class AdaptiveStageGAN:
             self.increase_coder_depth()
             self.specs["coder_specs"] = self.coders.get_specs()
             self.updated_coder_cardinality_flag = False
-            self.refresh_optimizers()
+            any_change = True
         elif train_change < 0.02:
             # update architecture, cardinality before depth
             self.save_cp(epoch, losses, backup=True)
             self.increase_coder_cardinality()
             self.specs["coder_specs"] = self.coders.get_specs()
             self.updated_coder_cardinality_flag = True
-            self.refresh_optimizers()
+            any_change = True
         elif self.updated_coder_cardinality_flag:
             self.updated_coder_cardinality_flag = False
+
+        if any_change:
+            self.compile(d_optimizer=torch.optim.Adam(self.critics.parameters(), lr=self.lr),
+                         g_optimizer=torch.optim.Adam(
+                             self.generators.parameters(), lr=self.lr),
+                         q_optimizer=torch.optim.Adam(
+                             self.coders.parameters(), lr=self.lr),
+                         grad_lambda=10, info_lambda=0.01)
+            self.models_to_device()
 
         return True
 
@@ -1063,6 +1084,14 @@ class AdaptiveStageGAN:
             losses = None
             running = None
             for epoch in range(start_epoch, self.epochs_per_phase):
+                print("current gan architecture")
+                print("------------------------")
+                print(
+                    f"generator spec: {self.specs['generator_specs'][self.image_shape]}")
+                print(
+                    f"critic spec: {self.specs['critic_specs'][self.image_shape]}")
+                print(
+                    f"coder spec: {self.specs['coder_specs'][self.image_shape]}")
                 prev_running = running
                 # train epoch and get running metrics
                 losses, metrics, running, eval_running = self.process_epoch(
