@@ -7,7 +7,8 @@ from pgan_torch_v3 import AdaptiveStageGAN
 import torch
 
 
-def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_clipping=False, gradient_centralization=False, next_image_shape=False):
+def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_clipping=False,
+             gradient_centralization=False, next_image_shape=False):
     """
     Attempt #2
     We will use a GAN architecture similar to infoGAN: https://arxiv.org/pdf/1606.03657.pdf
@@ -76,7 +77,9 @@ def main_gan(station, max_image_shape, cp_dir=None, lr=0.001, adaptive_gradient_
     gan.fit()
 
 
-def main_gan_v2(station, max_image_shape, cp_dir=None, lr=0.001, batch_size=None, adaptive_gradient_clipping=False, gradient_centralization=False, next_image_shape=False):
+def main_gan_v2(station, max_image_shape, cp_dir=None, lr=0.001, batch_size=None,
+                adaptive_gradient_clipping=False, gradient_centralization=False,
+                next_image_shape=False):
     """
     Attempt #2
     We will use a GAN architecture similar to infoGAN: https://arxiv.org/pdf/1606.03657.pdf
@@ -146,7 +149,9 @@ def main_gan_v2(station, max_image_shape, cp_dir=None, lr=0.001, batch_size=None
     gan.fit()
 
 
-def main_gan_v3(station, max_image_shape, cp_dir=None, lr=0.001, batch_size=None, adaptive_gradient_clipping=False, gradient_centralization=False, next_image_shape=False):
+def main_gan_v3(station, max_image_shape, cp_dir=None, lr=0.001, batch_size=None,
+                adaptive_gradient_clipping=False, gradient_centralization=False,
+                next_image_shape=False, debug_architect=False):
     """
     Attempt #2
     We will use a GAN architecture similar to infoGAN: https://arxiv.org/pdf/1606.03657.pdf
@@ -212,7 +217,8 @@ def main_gan_v3(station, max_image_shape, cp_dir=None, lr=0.001, batch_size=None
                            adaptive_gradient_clipping=adaptive_gradient_clipping,
                            gradient_centralization=gradient_centralization,
                            final_image_shape=max_image_shape,
-                           start_from_next_resolution=next_image_shape)
+                           start_from_next_resolution=next_image_shape,
+                           debug_architect=debug_architect)
     gan.fit()
 
 
@@ -234,6 +240,8 @@ if __name__ == "__main__":
                         help="activate gradient centering algorithm")
     parser.add_argument("--next", action="store_true",
                         help="skip to next image resolution in pGAN training")
+    parser.add_argument("--arch_debug", action="store_true",
+                        help="debug mode for architect: generate random loss values and generate architectures")
     args = parser.parse_args()
 
     print(f"running pytorch version {torch.__version__}")
@@ -255,4 +263,4 @@ if __name__ == "__main__":
     if args.v == 3:
         main_gan_v3(args.station, cp_dir=args.cp_dir,
                     max_image_shape=(128, 128), lr=args.lr, batch_size=args.bs, adaptive_gradient_clipping=args.agc,
-                    gradient_centralization=args.gc, next_image_shape=args.next)
+                    gradient_centralization=args.gc, next_image_shape=args.next, debug_architect=args.arch_debug)

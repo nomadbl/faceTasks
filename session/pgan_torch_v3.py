@@ -2,9 +2,13 @@ import itertools
 import os
 import copy
 import glob
+import numpy.random as random_np
+from sys import intern
 from typing import OrderedDict
 from warnings import filters
+from torch._C import wait
 from torch.autograd import grad
+from torch.cuda import random
 from torch.nn.modules.container import ModuleList
 from tqdm import tqdm
 from itertools import chain
@@ -13,10 +17,40 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import functools
-import operator
+import time
+import sys
 import torch
 
 C_AXIS = 1
+
+
+class Architect:
+    """finite state machine to handle logic of architecture optimization"""
+
+    def __init__(self, internal_state):
+        self.handlers = {}
+        self.currentState = None
+        self.haltStates = []
+        self.internal_state = internal_state
+
+    def add_state(self, name, handler, endState=False):
+        name = name.upper()
+        self.handlers[name] = handler
+        if endState:
+            self.haltStates.append(name)
+
+    def set_start(self, name):
+        self.currentState = name.upper()
+
+    def step(self, input):
+        try:
+            handler = self.handlers[self.currentState]
+        except:
+            raise ValueError("must call .set_start() before .step()")
+
+        while self.currentState not in self.haltStates:
+            (self.currentState, self.internal_state) = handler(
+                input, self.internal_state)
 
 
 class DimsTracker:
@@ -303,21 +337,21 @@ class AdaptiveResnext(torch.nn.Module):
             self.in_shape, self.filters, activation=self.activation, c_axis=self.c_axis))
         self.spec.append(1)
 
-    def increase_cardinality(self):
+    def increase_cardinality(self, block_index=-1):
         """
         return a copy of this resnet with cardinality increased by 1 on the last block.
         This is implemented for adaptive training where we increase the depth gradually
         """
-        self.blocks[-1].increase_cardinality()
-        self.spec[-1] += 1
+        self.blocks[block_index].increase_cardinality()
+        self.spec[block_index] += 1
 
-    def decrease_cardinality(self):
+    def decrease_cardinality(self, block_index=-1):
         """
         return a copy of this resnet with cardinality increased by 1 on the last block.
         This is implemented for adaptive training where we increase the depth gradually
         """
-        self.blocks[-1].decrease_cardinality()
-        self.spec[-1] -= 1
+        self.blocks[block_index].decrease_cardinality()
+        self.spec[block_index] -= 1
 
 
 def new_resnext(curr_dims: DimsTracker, filters, activation, spec=None):
@@ -385,11 +419,11 @@ class Critic(torch.nn.Module):
     def increase_depth(self):
         self.trunk.increase_depth()
 
-    def increase_cardinality(self):
-        self.trunk.increase_cardinality()
+    def increase_cardinality(self, index):
+        self.trunk.increase_cardinality(index)
 
-    def decrease_cardinality(self):
-        self.trunk.decrease_cardinality()
+    def decrease_cardinality(self, index):
+        self.trunk.decrease_cardinality(index)
 
     def forward(self, inputs):
         x, x_prev = inputs
@@ -436,11 +470,11 @@ class Coder(torch.nn.Module):
     def increase_depth(self):
         self.trunk.increase_depth()
 
-    def increase_cardinality(self):
-        self.trunk.increase_cardinality()
+    def increase_cardinality(self, index):
+        self.trunk.increase_cardinality(index)
 
-    def decrease_cardinality(self):
-        self.trunk.decrease_cardinality()
+    def decrease_cardinality(self, index):
+        self.trunk.decrease_cardinality(index)
 
     def forward(self, inputs):
         x, x_prev = inputs
@@ -478,11 +512,11 @@ class Generator(torch.nn.Module):
     def increase_depth(self):
         self.trunk.increase_depth()
 
-    def increase_cardinality(self):
-        self.trunk.increase_cardinality()
+    def increase_cardinality(self, index):
+        self.trunk.increase_cardinality(index)
 
-    def decrease_cardinality(self):
-        self.trunk.decrease_cardinality()
+    def decrease_cardinality(self, index):
+        self.trunk.decrease_cardinality(index)
 
     def forward(self, inputs):
         if self.c_axis == 1:
@@ -563,7 +597,7 @@ class GeneratorCollection(torch.nn.Module):
     def decrease_cardinality(self):
         self.generators[self.current_training_index].decrease_cardinality()
 
-    def forward(self, inputs: torch.Tensor):
+    def forward(self, inputs):
         if self.eval_model:
             # [code0, code1...] = inputs.
             if C_AXIS == 1:
@@ -626,11 +660,11 @@ class CriticCollection(torch.nn.Module):
     def increase_depth(self):
         self.critics[self.current_training_index].increase_depth()
 
-    def increase_cardinality(self):
-        self.critics[self.current_training_index].increase_cardinality()
+    def increase_cardinality(self, index):
+        self.critics[self.current_training_index].increase_cardinality(index)
 
-    def decrease_cardinality(self):
-        self.critics[self.current_training_index].decrease_cardinality()
+    def decrease_cardinality(self, index):
+        self.critics[self.current_training_index].decrease_cardinality(index)
 
     def get_specs(self):
         specs = {self.index_to_size[i]: self.critics[i].get_spec()
@@ -766,7 +800,8 @@ class AdaptiveStageGAN:
                  start_image_shape=(4, 4),
                  final_image_shape=(128, 128),
                  start_from_next_resolution=False,
-                 specs=None):
+                 specs=None,
+                 debug_architect=False):
         super(AdaptiveStageGAN, self).__init__()
 
         self.final_image_shape = final_image_shape
@@ -842,6 +877,8 @@ class AdaptiveStageGAN:
         self.device = torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
 
+        self.debug_architect = debug_architect
+
     def build_models(self, batchl_size, eval_model=False):
         """
         initialize models and send to device
@@ -888,6 +925,24 @@ class AdaptiveStageGAN:
         return train_dataset, val_dataset
 
     def process_epoch(self, train_ds, eval_ds, epoch):
+
+        if self.debug_architect:
+            key = input("press q to quit, anything else to continue")
+            if key == 'q':
+                sys.exit()
+            r_loss = torch.rand(100, 8).sum(dim=1)
+            losses = {"critic_loss": r_loss[0].item(),
+                      "info_loss": r_loss[1].item(),
+                      "gradient_penalty_loss": r_loss[2].item()}
+            metrics = {"critic_accuracy": r_loss[3].item(), "real_criticism_mean": r_loss[4].item(),
+                       "fake_criticism_mean": r_loss[5].item(), "real_criticism_std": r_loss[6].item(),
+                       "fake_criticism_std": r_loss[7].item()}
+            last_running = losses
+            last_running.update(metrics)
+            last_eval_running = losses
+            last_eval_running.update(metrics)
+            return losses, metrics, last_running, last_eval_running
+
         test_steps = 5
         # get datasets of resized images
         pin_memory = torch.cuda.is_available()
@@ -936,107 +991,82 @@ class AdaptiveStageGAN:
         progress_bar.close()
         return losses, metrics, last_running, last_eval_running
 
-    def increase_coder_depth(self):
+    def increase_coder_depth(self, input, internal_state):
         self.coders.increase_depth()
+        internal_state["cardinality"].append(1)
+        internal_state["index"] = 0
+        internal_state["updated_cardinality"] = False
+        internal_state["any_change"] = True
+        self.specs["coder_specs"] = self.coders.get_specs()
+        new_state = "train"
+        return new_state, internal_state
 
-    def increase_gan_depth(self):
+    def increase_gan_depth(self, input, internal_state):
         self.generators.increase_depth()
         self.critics.increase_depth()
+        self.specs["generator_specs"] = self.generators.get_specs()
+        self.specs["critic_specs"] = self.critics.get_specs()
+        internal_state["cardinality"].append(1)
+        internal_state["index"] = 0
+        internal_state["updated_cardinality"] = False
+        internal_state["any_change"] = True
+        new_state = "train"
+        return new_state, internal_state
 
-    def decrease_gan_cardinality(self):
-        self.generators.decrease_cardinality()
-        self.critics.decrease_cardinality()
+    def decrease_gan_cardinality(self, input, internal_state):
+        index = internal_state["index"]
+        self.generators.decrease_cardinality(index)
+        self.critics.decrease_cardinality(index)
+        self.specs["generator_specs"] = self.generators.get_specs()
+        self.specs["critic_specs"] = self.critics.get_specs()
+        internal_state["any_change"] = True
+        self.load_cp(get_backup=True, part='gan')
+        internal_state["cardinality"][index] -= 1
+        if internal_state["index"] == len(internal_state["spec"]) - 1:
+            new_state = "increase_depth"
+        else:
+            internal_state["index"] += 1
+            new_state = "train"
+        return new_state, internal_state
 
-    def increase_gan_cardinality(self):
-        self.generators.increase_cardinality()
+    def increase_gan_cardinality(self, input, internal_state):
+        index = internal_state["index"]
+        self.generators.increase_cardinality(index)
         self.critics.increase_cardinality()
+        self.specs["generator_specs"] = self.generators.get_specs()
+        self.specs["critic_specs"] = self.critics.get_specs()
+        internal_state["updated_cardinality"] = True
+        internal_state["any_change"] = True
+        internal_state["cardinality"][index] += 1
+        new_state = "train"
+        return new_state, internal_state
 
-    def decrease_coder_cardinality(self):
-        self.coders.decrease_cardinality()
+    def decrease_coder_cardinality(self, input, internal_state):
+        index = internal_state["index"]
+        self.coders.decrease_cardinality(index)
+        internal_state["any_change"] = True
+        self.specs["coder_specs"] = self.coders.get_specs()
+        self.load_cp(get_backup=True, part="coder")
+        internal_state["cardinality"][index] -= 1
+        if internal_state["index"] == len(internal_state["spec"]) - 1:
+            new_state = "increase_depth"
+        else:
+            internal_state["index"] += 1
+            new_state = "train"
+        return new_state, internal_state
 
-    def increase_coder_cardinality(self):
-        self.coders.increase_cardinality()
+    def increase_coder_cardinality(self, input, internal_state):
+        index = internal_state["index"]
+        self.coders.increase_cardinality(index)
+        self.specs["coder_specs"] = self.coders.get_specs()
+        internal_state["updated_cardinality"] = True
+        internal_state["any_change"] = True
+        internal_state["cardinality"][index] += 1
+        new_state = "train"
+        return new_state, internal_state
 
-    def refresh_optimizers(self):
-        opt_state = self.g_optimizer.state
-        self.g_optimizer = torch.optim.Adam(self.generators.parameters())
-        self.g_optimizer.state = opt_state
-        opt_state = self.d_optimizer.state
-        self.d_optimizer = torch.optim.Adam(self.critics.parameters())
-        self.d_optimizer.state = opt_state
-        opt_state = self.q_optimizer.state
-        self.q_optimizer = torch.optim.Adam(self.coders.parameters())
-        self.q_optimizer.state = opt_state
-
-    def update_architecture(self, epoch, losses, running, prev_running, eval_running):
-        epoch, losses, running, prev_running, eval_running
-        # update architecture of models if test and train loss are not too far apart
-        # and loss does not change within tolerance
-        any_change = False
-        if prev_running is None:
-            prev_running = {key: float("inf") for key in running}
-
-        # update gan architecture
-        train_change = abs(
-            running["critic_loss"] - prev_running["critic_loss"]) / abs(running["critic_loss"])
-        # bias = abs(
-        #     eval_running["critic_loss"] - running["critic_loss"]) / abs(eval_running["critic_loss"])
-        # if bias > 0.1:
-        #     # revert to previous unbiased model
-        #     self.load_cp(get_specs=True, get_backup=True)
-        #     self.load_cp(get_backup=True)
-        if train_change < 0.02 and self.updated_gan_cardinality_flag:
-            # load with less cardinality since that did not help
-            self.decrease_gan_cardinality()
-            self.specs["generator_specs"] = self.generators.get_specs()
-            self.specs["critic_specs"] = self.critics.get_specs()
-            self.load_cp(get_backup=True)
-            self.save_cp(epoch, losses, backup=True)
-            self.increase_gan_depth()
-            self.specs["generator_specs"] = self.generators.get_specs()
-            self.specs["critic_specs"] = self.critics.get_specs()
-            any_change = True
-        elif train_change < 0.02:
-            # update architecture, cardinality before depth
-            self.save_cp(epoch, losses, backup=True)
-            self.increase_gan_cardinality()
-            self.specs["generator_specs"] = self.generators.get_specs()
-            self.specs["critic_specs"] = self.critics.get_specs()
-            self.updated_gan_cardinality_flag = True
-            any_change = True
-        elif self.updated_gan_cardinality_flag:
-            self.updated_gan_cardinality_flag = False
-
-        # update coder architecture
-        train_change = abs(
-            running["info_loss"] - prev_running["info_loss"]) / abs(running["info_loss"])
-        # bias = abs(
-        #     eval_running["info_loss"] - running["info_loss"]) / abs(eval_running["info_loss"])
-        # if bias > 0.1:
-        #     # revert to previous unbiased model
-        #     self.load_cp(get_specs=True, get_backup=True)
-        #     self.load_cp(get_backup=True)
-        if train_change < 0.02 and self.updated_coder_cardinality_flag:
-            # load with less cardinality since that did not help
-            self.decrease_coder_cardinality()
-            self.specs["coder_specs"] = self.coders.get_specs()
-            self.load_cp(get_backup=True)
-            self.save_cp(epoch, losses, backup=True)
-            self.increase_coder_depth()
-            self.specs["coder_specs"] = self.coders.get_specs()
-            self.updated_coder_cardinality_flag = False
-            any_change = True
-        elif train_change < 0.02:
-            # update architecture, cardinality before depth
-            self.save_cp(epoch, losses, backup=True)
-            self.increase_coder_cardinality()
-            self.specs["coder_specs"] = self.coders.get_specs()
-            self.updated_coder_cardinality_flag = True
-            any_change = True
-        elif self.updated_coder_cardinality_flag:
-            self.updated_coder_cardinality_flag = False
-
-        if any_change:
+    def architect_prepare_train(self, input, internal_state):
+        if internal_state["any_change"]:
             self.compile(d_optimizer=torch.optim.Adam(self.critics.parameters(), lr=self.lr),
                          g_optimizer=torch.optim.Adam(
                              self.generators.parameters(), lr=self.lr),
@@ -1044,8 +1074,32 @@ class AdaptiveStageGAN:
                              self.coders.parameters(), lr=self.lr),
                          grad_lambda=10, info_lambda=0.01)
             self.models_to_device()
+            internal_state["any_change"] = False
+        next_state = "check_loss"
+        return next_state, internal_state
 
-        return True
+    def architect_check_loss(self, input, internal_state):
+        epoch = input[0]
+        loss_name = input[1]
+        part = input[2]
+        losses = input[3]
+        running = input[4]
+        threshold = input[5]
+
+        loss = running[loss_name]
+        prev_loss = internal_state["loss"]
+        d_loss = abs(loss - prev_loss) / abs(loss)
+        if d_loss < threshold:
+            if internal_state["updated_cardinality"]:
+                next_state = "decrease_cardinality"
+            else:
+                next_state = "increase_cardinality"
+        else:
+            self.save_cp(epoch=epoch, losses=losses, backup=True, part=part)
+            internal_state["updated_cardinality"] = False
+            next_state = "train"
+
+        return next_state, internal_state
 
     def fit(self):
         """
@@ -1054,6 +1108,50 @@ class AdaptiveStageGAN:
         Adjust image inputs to correct resolution
         :return:
         """
+        # define architect logic
+        gan_architect = Architect(internal_state={"any_change": False,
+                                                  "updated_cardinality": False,
+                                                  "cardinality": copy.copy(self.specs["generator_specs"]),
+                                                  "index": 0,
+                                                  "loss": float("inf")})
+        coder_architect = Architect(internal_state={"any_change": False,
+                                                    "updated_cardinality": False,
+                                                    "cardinality": copy.copy(self.specs["coder_specs"]),
+                                                    "index": 0,
+                                                    "loss": float("inf")})
+
+        def reset_architect_index(input, internal_state):
+            internal_state["index"] = 0
+            return ("check_loss", internal_state)
+
+        gan_architect.add_state(
+            name="train", handler=lambda input, internal_state: ("check_loss", internal_state))
+        gan_architect.add_state(
+            name="check_loss", handler=self.architect_check_loss)
+        gan_architect.add_state(
+            name="increase_cardinality", handler=self.increase_gan_cardinality)
+        gan_architect.add_state(
+            name="decrease_cardinality", handler=self.decrease_gan_cardinality)
+        gan_architect.add_state(
+            name="increase_depth", handler=self.increase_gan_depth)
+        gan_architect.add_state(
+            name="reset_index", handler=reset_architect_index)
+
+        coder_architect.add_state(
+            name="train", handler=lambda input, internal_state: ("check_loss", internal_state))
+        coder_architect.add_state(
+            name="check_loss", handler=self.architect_check_loss)
+        coder_architect.add_state(
+            name="increase_cardinality", handler=self.increase_coder_cardinality)
+        coder_architect.add_state(
+            name="decrease_cardinality", handler=self.decrease_coder_cardinality)
+        coder_architect.add_state(
+            name="increase_depth", handler=self.increase_coder_depth)
+        coder_architect.add_state(
+            name="reset_index", handler=reset_architect_index)
+
+        gan_architect.set_start("train")
+        coder_architect.set_start("train")
 
         while True:
             # build models
@@ -1076,7 +1174,15 @@ class AdaptiveStageGAN:
                              self.coders.parameters(), lr=self.lr),
                          grad_lambda=10, info_lambda=0.01)
             # load checkpoint
-            start_epoch = self.load_cp()
+            start_epoch, gan_architect_internal_state = self.load_cp(
+                part="gan")
+            _, coder_architect_internal_state = self.load_cp(part="coder")
+
+            if gan_architect_internal_state:
+                gan_architect.internal_state = gan_architect_internal_state
+            if coder_architect_internal_state:
+                coder_architect.internal_state = coder_architect_internal_state
+
             if self.start_from_next_resolution:
                 self.start_from_next_resolution = False  # only do once
             self.models_to_device()
@@ -1092,47 +1198,73 @@ class AdaptiveStageGAN:
                     f"critic spec: {self.specs['critic_specs'][self.image_shape]}")
                 print(
                     f"coder spec: {self.specs['coder_specs'][self.image_shape]}")
-                prev_running = running
                 # train epoch and get running metrics
                 losses, metrics, running, eval_running = self.process_epoch(
                     train_ds, eval_ds, epoch)
-                success = self.update_architecture(
-                    epoch, losses, running, prev_running, eval_running)
-                if not success:
-                    break
+                # optimize architectures
+                threshold = 0.1
+                loss_name = "critic_loss"
+                part = "gan"
+                architect_input = [epoch, loss_name,
+                                   part, losses, running, threshold]
+                gan_architect.step(architect_input)
+                loss_name = "info_loss"
+                part = "coder"
+                architect_input = [epoch, loss_name,
+                                   part, losses, running, threshold]
+                coder_architect.step(architect_input)
+
+                if epoch % (self.epochs_per_phase // 4) == (self.epochs_per_phase // 4) - 1:
+                    self.save_cp(epoch, losses, part="gan",
+                                 architect=gan_architect)
+                    self.save_cp(epoch, losses, part="coder",
+                                 architect=coder_architect)
 
             # checkpoint model
-            self.save_cp('end', losses)
+            self.save_cp('end', losses, part="gan", architect=gan_architect)
+            self.save_cp('end', losses, part="coder",
+                         architect=coder_architect)
 
         self.tensorboard_writer.close()
 
-    def save_cp(self, epoch, losses, backup=False):
-        cp_dict = {
-            'epoch': epoch,
-            'generator_state_dict': self.generators.state_dict(),
-            'critic_state_dict': self.critics.state_dict(),
-            'coder_state_dict': self.coders.state_dict(),
-            'd_optimizer_state_dict': self.d_optimizer.state_dict(),
-            'g_optimizer_state_dict': self.g_optimizer.state_dict(),
-            'q_optimizer_state_dict': self.q_optimizer.state_dict(),
-            'image_shape': self.image_shape,
-            'specs': self.specs
-        }
+    def save_cp(self, epoch, losses, backup=False, part='gan', architect=None):
+        if part == 'gan':
+            cp_dict = {
+                'epoch': epoch,
+                'generator_state_dict': self.generators.state_dict(),
+                'critic_state_dict': self.critics.state_dict(),
+                'd_optimizer_state_dict': self.d_optimizer.state_dict(),
+                'g_optimizer_state_dict': self.g_optimizer.state_dict(),
+                'image_shape': self.image_shape,
+                'generator_specs': self.specs,
+                'critic_specs': self.specs}
+        elif part == 'coder':
+            cp_dict = {
+                'epoch': epoch,
+                'coder_state_dict': self.coders.state_dict(),
+                'q_optimizer_state_dict': self.q_optimizer.state_dict(),
+                'image_shape': self.image_shape,
+                'coder_specs': self.specs}
+
+        cp_dict.update(
+            {"architect_state", architect.internal_state if architect else None})
+
         cp_dict.update(losses)
         if not os.path.exists(self.cp_dir):
             os.mkdir(self.cp_dir)
-        pre = 'backup_checkpoint' if backup else 'checkpoint'
+        pre = f'backup_{part}_checkpoint' if backup else f'{part}_checkpoint'
         torch.save(cp_dict, os.path.join(
             self.cp_dir, f"{pre}_{self.image_shape[0]}_{self.image_shape[1]}.pth"))
 
-    def get_latest_checkpoint(self):
+    def get_latest_checkpoint(self, backup=False, part='gan'):
         # default value
-        curr_checkpoint = f"checkpoint_{self.start_image_shape[0]}_{self.start_image_shape[1]}.pth"
+        pre = f"{part}_backup_checkpoint" if backup else f"{part}_checkpoint"
+        curr_checkpoint = f"{pre}_{self.start_image_shape[0]}_{self.start_image_shape[1]}.pth"
         if os.path.exists(self.cp_dir):
             # find latest checkpoint
 
             checkpoints = glob.glob(os.path.join(
-                self.cp_dir, "checkpoint_*_*.pth"))
+                self.cp_dir, "{pre}_*_*.pth"))
             if len(checkpoints) > 0:
                 def get_image_shape_from_cp(cp):
                     fn = cp.split(sep='/')[-1]
@@ -1146,58 +1278,47 @@ class AdaptiveStageGAN:
 
         return curr_checkpoint
 
-    def get_backup_checkpoint(self):
-        # default value
-        curr_checkpoint = f"backup_checkpoint_{self.start_image_shape[0]}_{self.start_image_shape[1]}.pth"
-        if os.path.exists(self.cp_dir):
-            # find latest checkpoint
+    def load_cp(self, load_optimizer_state=False, get_specs=False, get_backup=False, part="gan"):
 
-            checkpoints = glob.glob(os.path.join(
-                self.cp_dir, "backup_checkpoint_*_*.pth"))
-            if len(checkpoints) > 0:
-                def get_image_shape_from_cp(cp):
-                    fn = cp.split(sep='/')[-1]
-                    fn = fn.split(sep='.')[0]
-                    i = fn.split(sep='_')[-2]
-                    return int(i)
-                checkpoints_by_image_shape = {
-                    get_image_shape_from_cp(cp): cp for cp in checkpoints}
-                max_image_shape = max(checkpoints_by_image_shape.keys())
-                curr_checkpoint = checkpoints_by_image_shape[max_image_shape]
-        return curr_checkpoint
-
-    def load_cp(self, load_optimizer_state=False, get_specs=False, get_backup=False):
-        if get_backup:
-            curr_checkpoint = self.get_backup_checkpoint()
-        else:
-            curr_checkpoint = self.get_latest_checkpoint()
+        curr_checkpoint = self.get_latest_checkpoint(get_backup, part)
         if os.path.exists(os.path.join(self.cp_dir, curr_checkpoint)):
             checkpoint = torch.load(os.path.join(
                 self.cp_dir, curr_checkpoint), map_location=self.device)
 
             if get_specs:
-                self.specs = checkpoint['specs']
+                if part == "gan":
+                    self.specs['generator_specs'] = checkpoint['generator_specs']
+                    self.specs['critic_specs'] = checkpoint['critic_specs']
+                elif part == "coder":
+                    self.specs["coder_specs"] = checkpoint['coder_specs']
                 return
 
             cleaned_checkpoint = copy.deepcopy(checkpoint)
             if checkpoint['epoch'] == 'end' or self.start_from_next_resolution:
                 cleaned_checkpoint['epoch'] = 0
+                cleaned_checkpoint["architect_state"] = None
 
-            self.generators.load_state_dict(
-                cleaned_checkpoint['generator_state_dict'], strict=False)
-            self.critics.load_state_dict(
-                cleaned_checkpoint['critic_state_dict'], strict=False)
-            self.coders.load_state_dict(
-                cleaned_checkpoint['coder_state_dict'], strict=False)
-            if load_optimizer_state:
-                self.g_optimizer.load_state_dict(
-                    cleaned_checkpoint['g_optimizer_state_dict'])
-                self.d_optimizer.load_state_dict(
-                    cleaned_checkpoint['d_optimizer_state_dict'])
-            return cleaned_checkpoint['epoch']
+            if part == "gan":
+                self.generators.load_state_dict(
+                    cleaned_checkpoint['generator_state_dict'], strict=False)
+                self.critics.load_state_dict(
+                    cleaned_checkpoint['critic_state_dict'], strict=False)
+                if load_optimizer_state:
+                    self.g_optimizer.load_state_dict(
+                        cleaned_checkpoint['g_optimizer_state_dict'])
+                    self.d_optimizer.load_state_dict(
+                        cleaned_checkpoint['d_optimizer_state_dict'])
+            elif part == "coder":
+                self.coders.load_state_dict(
+                    cleaned_checkpoint['coder_state_dict'], strict=False)
+                if load_optimizer_state:
+                    self.q_optimizer.load_state_dict(
+                        cleaned_checkpoint['q_optimizer_state_dict'])
+            return cleaned_checkpoint['epoch'], cleaned_checkpoint["architect_state"]
         else:
-            print("checkpoint file not found. Starting training from scratch")
-            return 0  # start epoch = 0
+            print(
+                "checkpoint file not found. returning epoch = 0 (start training from scratch?)")
+            return 0, None  # start epoch = 0
 
     def load_image_shape(self):
         """
