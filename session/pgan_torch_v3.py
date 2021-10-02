@@ -1131,7 +1131,7 @@ class AdaptiveStageGAN:
             return ("check_loss", internal_state)
 
         gan_architect.add_state(
-            name="train", handler=lambda input, internal_state: ("check_loss", internal_state))
+            name="train", handler=self.architect_prepare_train)
         gan_architect.add_state(
             name="check_loss", handler=self.architect_check_loss, haltState=True)
         gan_architect.add_state(
@@ -1144,7 +1144,7 @@ class AdaptiveStageGAN:
             name="reset_index", handler=reset_architect_index)
 
         coder_architect.add_state(
-            name="train", handler=lambda input, internal_state: ("check_loss", internal_state))
+            name="train", handler=self.architect_prepare_train)
         coder_architect.add_state(
             name="check_loss", handler=self.architect_check_loss, haltState=True)
         coder_architect.add_state(
@@ -1203,7 +1203,6 @@ class AdaptiveStageGAN:
 
             if self.start_from_next_resolution:
                 self.start_from_next_resolution = False  # only do once
-            self.models_to_device()
 
             losses = None
             running = None
@@ -1217,6 +1216,9 @@ class AdaptiveStageGAN:
                 print(
                     f"coder spec: {self.specs['coder_specs'][self.image_shape]}")
                 # train epoch and get running metrics
+                if epoch == 0:
+                    self.models_to_device()
+
                 losses, metrics, running, eval_running = self.process_epoch(
                     train_ds, eval_ds, epoch)
 
