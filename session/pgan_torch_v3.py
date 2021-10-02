@@ -33,10 +33,10 @@ class Architect:
         self.haltStates = []
         self.internal_state = internal_state
 
-    def add_state(self, name, handler, endState=False):
+    def add_state(self, name, handler, haltState=False):
         name = name.upper()
         self.handlers[name] = handler
-        if endState:
+        if haltState:
             self.haltStates.append(name)
 
     def set_start(self, name):
@@ -48,9 +48,19 @@ class Architect:
         except:
             raise ValueError("must call .set_start() before .step()")
 
-        while self.currentState not in self.haltStates:
-            (self.currentState, self.internal_state) = handler(
+        while True:
+            handler = self.handlers[self.currentState]
+            # print(f'loss: {input["running"][input["loss_name"]]}')
+            # print(f"internal state: {self.internal_state}")
+            print(
+                f"epoch {input['epoch']} {input['part']} entering {self.currentState}")
+
+            currentState, internal_state = handler(
                 input, self.internal_state)
+            self.currentState = currentState.upper()
+            self.internal_state = internal_state
+            if self.currentState not in self.haltStates:
+                break
 
 
 class DimsTracker:
@@ -230,7 +240,7 @@ class ResnextBranch(torch.nn.Module):
 
 
 class ResnextBlock(torch.nn.Module):
-    def __init__(self, in_shape, filters, cardinality=1, activation='relu', c_axis=C_AXIS, branches=None, branch_weights=None):
+    def __init__(self, in_shape, filters, cardinality=1, activation='relu', c_axis=C_AXIS, branch_weights=None):
         super().__init__()
         self.cardinality = cardinality
         self.filters = filters
@@ -238,13 +248,11 @@ class ResnextBlock(torch.nn.Module):
         self.in_shape = in_shape
         self.c_axis = c_axis
 
-        if branches is None:
-            self.branches = torch.nn.ModuleList()
-            for c in range(cardinality):
-                self.branches.append(ResnextBranch(
-                    in_shape, filters, activation=activation, c_axis=c_axis))
-        else:
-            self.branches = branches
+        self.branches = torch.nn.ModuleList()
+        for c in range(cardinality):
+            self.branches.append(ResnextBranch(
+                in_shape, filters, activation=activation, c_axis=c_axis))
+
         if branch_weights is None:
             self.branch_weights = torch.nn.ParameterList(
                 [torch.nn.parameter.Parameter(torch.tensor(1, dtype=torch.float32), requires_grad=True)])
@@ -287,38 +295,21 @@ class ResnextBlock(torch.nn.Module):
 
 
 class AdaptiveResnext(torch.nn.Module):
-    def __init__(self, in_shape, filters, activation='relu', c_axis=C_AXIS, blocks=None, out_factors=None, spec=None):
+    def __init__(self, in_shape, filters, activation='relu', c_axis=C_AXIS, spec=None):
         super().__init__()
         self.filters = filters
         self.activation = activation
         self.in_shape = in_shape
         self.c_axis = c_axis
-        if spec is None:
-            self.spec = [1]
-            if out_factors is None:
-                self.out_factors = torch.nn.ParameterList([torch.nn.parameter.Parameter(
-                    torch.tensor(1, dtype=torch.float32), requires_grad=True)])
-            else:
-                self.out_factors = out_factors
-            if blocks is None:
-                self.blocks = torch.nn.ModuleList([ResnextBlock(in_shape=self.in_shape, filters=self.filters,
-                                                                activation=activation, c_axis=self.c_axis)])
-            else:
-                self.branches = blocks
-        else:
-            # spec is a list of cardianlities. one item per each block to add
-            self.spec = spec
-            self.out_factors = torch.nn.ParameterList()
-            self.blocks = torch.nn.ModuleList()
-            for cardinality in spec:
-                self.out_factors.append(torch.nn.parameter.Parameter(
-                    torch.tensor(1, dtype=torch.float32), requires_grad=True))
-                branch_weights = torch.nn.ParameterList()
-                for c in range(cardinality):
-                    branch_weights.append(torch.nn.parameter.Parameter(
-                        torch.tensor(1, dtype=torch.float32), requires_grad=True))
-                self.blocks.append(ResnextBlock(self.in_shape, self.filters, cardinality,
-                                                activation=activation, c_axis=self.c_axis, branch_weights=branch_weights))
+        self.spec = [1] if spec is None else spec
+        # spec is a list of cardianlities. one item per each block to add
+        self.out_factors = torch.nn.ParameterList()
+        self.blocks = torch.nn.ModuleList()
+        for cardinality in self.spec:
+            self.out_factors.append(torch.nn.parameter.Parameter(
+                torch.tensor(1, dtype=torch.float32), requires_grad=True))
+            self.blocks.append(ResnextBlock(self.in_shape, self.filters, cardinality,
+                                            activation=activation, c_axis=self.c_axis))
 
     def forward(self, input):
         x = input
@@ -559,7 +550,8 @@ class GeneratorCollection(torch.nn.Module):
         while size != final_image_shape:
             size = [size[0] * 2, size[1] * 2]
             self.index_to_size.append(tuple(size))
-            spec = None if specs is None else specs[tuple(size)]
+            spec = None if specs is None else specs[tuple(
+                size)]
             self.generators.append(
                 Generator(dims.curr_dim, filters=4, embedding_dim=embedding_dim, spec=spec))
             dims.update_dims(
@@ -591,11 +583,13 @@ class GeneratorCollection(torch.nn.Module):
     def increase_depth(self):
         self.generators[self.current_training_index].increase_depth()
 
-    def increase_cardinality(self):
-        self.generators[self.current_training_index].increase_cardinality()
+    def increase_cardinality(self, index):
+        self.generators[self.current_training_index].increase_cardinality(
+            index)
 
-    def decrease_cardinality(self):
-        self.generators[self.current_training_index].decrease_cardinality()
+    def decrease_cardinality(self, index):
+        self.generators[self.current_training_index].decrease_cardinality(
+            index)
 
     def forward(self, inputs):
         if self.eval_model:
@@ -637,7 +631,8 @@ class CriticCollection(torch.nn.Module):
         i = 0
         while size != final_image_shape:
             size = [size[0] * 2, size[1] * 2]
-            spec = None if specs is None else specs[tuple(size)]
+            spec = None if specs is None else specs[tuple(
+                size)]
             self.index_to_size.append(tuple(size))
             input_dim = [batch_size, 3, *
                          size] if C_AXIS == 1 else [batch_size, *size, 3]
@@ -736,11 +731,11 @@ class CoderCollection(torch.nn.Module):
     def increase_depth(self):
         self.coders[self.current_training_index].increase_depth()
 
-    def increase_cardinality(self):
-        self.coders[self.current_training_index].increase_cardinality()
+    def increase_cardinality(self, index):
+        self.coders[self.current_training_index].increase_cardinality(index)
 
-    def decrease_cardinality(self):
-        self.coders[self.current_training_index].decrease_cardinality()
+    def decrease_cardinality(self, index):
+        self.coders[self.current_training_index].decrease_cardinality(index)
 
     def forward(self, inputs):
         if self.eval_model:
@@ -927,10 +922,12 @@ class AdaptiveStageGAN:
     def process_epoch(self, train_ds, eval_ds, epoch):
 
         if self.debug_architect:
-            key = input("press q to quit, anything else to continue")
-            if key == 'q':
-                sys.exit()
+            # key = input("press q to quit, anything else to continue")
+            # if key == 'q':
+            #     sys.exit()
             r_loss = torch.rand(100, 8).sum(dim=1)
+            r_loss = torch.tensor(epoch+1) * r_loss
+            # print(f"epoch={epoch}")
             losses = {"critic_loss": r_loss[0].item(),
                       "info_loss": r_loss[1].item(),
                       "gradient_penalty_loss": r_loss[2].item()}
@@ -993,9 +990,8 @@ class AdaptiveStageGAN:
 
     def increase_coder_depth(self, input, internal_state):
         self.coders.increase_depth()
-        internal_state["cardinality"].append(1)
+        internal_state["cardinality"][self.image_shape].append(1)
         internal_state["index"] = 0
-        internal_state["updated_cardinality"] = False
         internal_state["any_change"] = True
         self.specs["coder_specs"] = self.coders.get_specs()
         new_state = "train"
@@ -1006,23 +1002,26 @@ class AdaptiveStageGAN:
         self.critics.increase_depth()
         self.specs["generator_specs"] = self.generators.get_specs()
         self.specs["critic_specs"] = self.critics.get_specs()
-        internal_state["cardinality"].append(1)
+        internal_state["cardinality"][self.image_shape].append(1)
         internal_state["index"] = 0
-        internal_state["updated_cardinality"] = False
         internal_state["any_change"] = True
         new_state = "train"
         return new_state, internal_state
 
     def decrease_gan_cardinality(self, input, internal_state):
         index = internal_state["index"]
-        self.generators.decrease_cardinality(index)
-        self.critics.decrease_cardinality(index)
-        self.specs["generator_specs"] = self.generators.get_specs()
-        self.specs["critic_specs"] = self.critics.get_specs()
-        internal_state["any_change"] = True
-        self.load_cp(get_backup=True, part='gan')
-        internal_state["cardinality"][index] -= 1
-        if internal_state["index"] == len(internal_state["spec"]) - 1:
+        internal_state["updated_cardinality"] = False
+        if internal_state["cardinality"][self.image_shape] is None:
+            internal_state["cardinality"][self.image_shape] = 1
+        if internal_state["cardinality"][self.image_shape][index] > 1:
+            self.generators.decrease_cardinality(index)
+            self.critics.decrease_cardinality(index)
+            self.specs["generator_specs"] = self.generators.get_specs()
+            self.specs["critic_specs"] = self.critics.get_specs()
+            internal_state["any_change"] = True
+            self.load_cp(get_backup=True, part='gan')
+            internal_state["cardinality"][self.image_shape][index] -= 1
+        if internal_state["index"] == len(internal_state["cardinality"][self.image_shape]) - 1:
             new_state = "increase_depth"
         else:
             internal_state["index"] += 1
@@ -1032,23 +1031,29 @@ class AdaptiveStageGAN:
     def increase_gan_cardinality(self, input, internal_state):
         index = internal_state["index"]
         self.generators.increase_cardinality(index)
-        self.critics.increase_cardinality()
+        self.critics.increase_cardinality(index)
         self.specs["generator_specs"] = self.generators.get_specs()
         self.specs["critic_specs"] = self.critics.get_specs()
         internal_state["updated_cardinality"] = True
         internal_state["any_change"] = True
-        internal_state["cardinality"][index] += 1
+        if internal_state["cardinality"][tuple(self.image_shape)] is None:
+            internal_state["cardinality"][tuple(self.image_shape)] = [1]
+        internal_state["cardinality"][tuple(self.image_shape)][index] += 1
         new_state = "train"
         return new_state, internal_state
 
     def decrease_coder_cardinality(self, input, internal_state):
         index = internal_state["index"]
-        self.coders.decrease_cardinality(index)
-        internal_state["any_change"] = True
-        self.specs["coder_specs"] = self.coders.get_specs()
-        self.load_cp(get_backup=True, part="coder")
-        internal_state["cardinality"][index] -= 1
-        if internal_state["index"] == len(internal_state["spec"]) - 1:
+        internal_state["updated_cardinality"] = False
+        if internal_state["cardinality"][self.image_shape] is None:
+            internal_state["cardinality"][self.image_shape] = 1
+        if internal_state["cardinality"][self.image_shape][index] > 1:
+            self.coders.decrease_cardinality(index)
+            internal_state["any_change"] = True
+            self.specs["coder_specs"] = self.coders.get_specs()
+            self.load_cp(get_backup=True, part="coder")
+            internal_state["cardinality"][self.image_shape][index] -= 1
+        if internal_state["index"] == len(internal_state["cardinality"][self.image_shape]) - 1:
             new_state = "increase_depth"
         else:
             internal_state["index"] += 1
@@ -1061,7 +1066,9 @@ class AdaptiveStageGAN:
         self.specs["coder_specs"] = self.coders.get_specs()
         internal_state["updated_cardinality"] = True
         internal_state["any_change"] = True
-        internal_state["cardinality"][index] += 1
+        if internal_state["cardinality"][tuple(self.image_shape)] is None:
+            internal_state["cardinality"][tuple(self.image_shape)] = [1]
+        internal_state["cardinality"][tuple(self.image_shape)][index] += 1
         new_state = "train"
         return new_state, internal_state
 
@@ -1079,12 +1086,12 @@ class AdaptiveStageGAN:
         return next_state, internal_state
 
     def architect_check_loss(self, input, internal_state):
-        epoch = input[0]
-        loss_name = input[1]
-        part = input[2]
-        losses = input[3]
-        running = input[4]
-        threshold = input[5]
+        epoch = input["epoch"]
+        loss_name = input["loss_name"]
+        part = input["part"]
+        losses = input["losses"]
+        running = input["running"]
+        threshold = input["threshold"]
 
         loss = running[loss_name]
         prev_loss = internal_state["loss"]
@@ -1099,24 +1106,19 @@ class AdaptiveStageGAN:
             internal_state["updated_cardinality"] = False
             next_state = "train"
 
+        internal_state["loss"] = loss
+
         return next_state, internal_state
 
-    def fit(self):
-        """
-        Custom training loop.
-        load models as needed.
-        Adjust image inputs to correct resolution
-        :return:
-        """
-        # define architect logic
+    def init_architects(self):
         gan_architect = Architect(internal_state={"any_change": False,
                                                   "updated_cardinality": False,
-                                                  "cardinality": copy.copy(self.specs["generator_specs"]),
+                                                  "cardinality": copy.copy(self.generators.get_specs()),
                                                   "index": 0,
                                                   "loss": float("inf")})
         coder_architect = Architect(internal_state={"any_change": False,
                                                     "updated_cardinality": False,
-                                                    "cardinality": copy.copy(self.specs["coder_specs"]),
+                                                    "cardinality": copy.copy(self.coders.get_specs()),
                                                     "index": 0,
                                                     "loss": float("inf")})
 
@@ -1127,7 +1129,7 @@ class AdaptiveStageGAN:
         gan_architect.add_state(
             name="train", handler=lambda input, internal_state: ("check_loss", internal_state))
         gan_architect.add_state(
-            name="check_loss", handler=self.architect_check_loss)
+            name="check_loss", handler=self.architect_check_loss, haltState=True)
         gan_architect.add_state(
             name="increase_cardinality", handler=self.increase_gan_cardinality)
         gan_architect.add_state(
@@ -1140,7 +1142,7 @@ class AdaptiveStageGAN:
         coder_architect.add_state(
             name="train", handler=lambda input, internal_state: ("check_loss", internal_state))
         coder_architect.add_state(
-            name="check_loss", handler=self.architect_check_loss)
+            name="check_loss", handler=self.architect_check_loss, haltState=True)
         coder_architect.add_state(
             name="increase_cardinality", handler=self.increase_coder_cardinality)
         coder_architect.add_state(
@@ -1152,8 +1154,17 @@ class AdaptiveStageGAN:
 
         gan_architect.set_start("train")
         coder_architect.set_start("train")
+        return gan_architect, coder_architect
 
+    def fit(self):
+        """
+        Custom training loop.
+        load models as needed.
+        Adjust image inputs to correct resolution
+        :return:
+        """
         while True:
+
             # build models
             finished = self.load_image_shape()
             self.tensorboard_writer = SummaryWriter(
@@ -1166,6 +1177,9 @@ class AdaptiveStageGAN:
 
             self.load_cp(get_specs=True)
             self.build_models(batchl_size, eval_model=False)
+
+            # define architect logic
+            gan_architect, coder_architect = self.init_architects()
 
             self.compile(d_optimizer=torch.optim.Adam(self.critics.parameters(), lr=self.lr),
                          g_optimizer=torch.optim.Adam(
@@ -1205,13 +1219,19 @@ class AdaptiveStageGAN:
                 threshold = 0.1
                 loss_name = "critic_loss"
                 part = "gan"
-                architect_input = [epoch, loss_name,
-                                   part, losses, running, threshold]
+                architect_input = {"epoch": epoch, "loss_name": loss_name,
+                                   "part": part, "losses": losses, "running": running,
+                                   "threshold": threshold}
                 gan_architect.step(architect_input)
+
+                assert gan_architect.internal_state["cardinality"] == self.generators.get_specs(
+                ), "specs dont match"
+
                 loss_name = "info_loss"
                 part = "coder"
-                architect_input = [epoch, loss_name,
-                                   part, losses, running, threshold]
+                architect_input = {"epoch": epoch, "loss_name": loss_name,
+                                   "part": part, "losses": losses, "running": running,
+                                   "threshold": threshold}
                 coder_architect.step(architect_input)
 
                 if epoch % (self.epochs_per_phase // 4) == (self.epochs_per_phase // 4) - 1:
@@ -1236,18 +1256,18 @@ class AdaptiveStageGAN:
                 'd_optimizer_state_dict': self.d_optimizer.state_dict(),
                 'g_optimizer_state_dict': self.g_optimizer.state_dict(),
                 'image_shape': self.image_shape,
-                'generator_specs': self.specs,
-                'critic_specs': self.specs}
+                'generator_specs': self.specs['generator_specs'],
+                'critic_specs': self.specs['critic_specs']}
         elif part == 'coder':
             cp_dict = {
                 'epoch': epoch,
                 'coder_state_dict': self.coders.state_dict(),
                 'q_optimizer_state_dict': self.q_optimizer.state_dict(),
                 'image_shape': self.image_shape,
-                'coder_specs': self.specs}
+                'coder_specs': self.specs['coder_specs']}
 
         cp_dict.update(
-            {"architect_state", architect.internal_state if architect else None})
+            {"architect_state": architect.internal_state if architect else None})
 
         cp_dict.update(losses)
         if not os.path.exists(self.cp_dir):
@@ -1279,8 +1299,8 @@ class AdaptiveStageGAN:
         return curr_checkpoint
 
     def load_cp(self, load_optimizer_state=False, get_specs=False, get_backup=False, part="gan"):
-
         curr_checkpoint = self.get_latest_checkpoint(get_backup, part)
+        print(f"current checkpoint {curr_checkpoint}")
         if os.path.exists(os.path.join(self.cp_dir, curr_checkpoint)):
             checkpoint = torch.load(os.path.join(
                 self.cp_dir, curr_checkpoint), map_location=self.device)
