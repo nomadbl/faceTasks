@@ -43,20 +43,19 @@ class Architect:
         self.currentState = name.upper()
 
     def step(self, input):
-        try:
-            handler = self.handlers[self.currentState]
-        except:
-            raise ValueError("must call .set_start() before .step()")
 
         while True:
-            handler = self.handlers[self.currentState]
-            # print(f'loss: {input["running"][input["loss_name"]]}')
-            # print(f"internal state: {self.internal_state}")
-            print(
-                f"epoch {input['epoch']} {input['part']} entering {self.currentState}")
-
+            try:
+                handler = self.handlers[self.currentState]
+            except:
+                raise ValueError("must call .set_start() before .step()")
+            # print(
+            #     f"epoch {input['epoch']} {input['part']} entering {self.currentState}")
+            # print(f'handler: {handler}')
             currentState, internal_state = handler(
                 input, self.internal_state)
+            # if input['part'] == 'gan':
+            #     print(f"{self.currentState}->{currentState.upper()}")
             self.currentState = currentState.upper()
             self.internal_state = internal_state
             if self.currentState not in self.haltStates:
@@ -1032,8 +1031,13 @@ class AdaptiveStageGAN:
         index = internal_state["index"]
         self.generators.increase_cardinality(index)
         self.critics.increase_cardinality(index)
-        self.specs["generator_specs"] = self.generators.get_specs()
-        self.specs["critic_specs"] = self.critics.get_specs()
+
+        assert self.generators.get_specs() == self.critics.get_specs()
+
+        self.specs["generator_specs"] = copy.deepcopy(
+            self.generators.get_specs())
+        self.specs["critic_specs"] = copy.deepcopy(self.critics.get_specs())
+
         internal_state["updated_cardinality"] = True
         internal_state["any_change"] = True
         if internal_state["cardinality"][tuple(self.image_shape)] is None:
@@ -1113,12 +1117,12 @@ class AdaptiveStageGAN:
     def init_architects(self):
         gan_architect = Architect(internal_state={"any_change": False,
                                                   "updated_cardinality": False,
-                                                  "cardinality": copy.copy(self.generators.get_specs()),
+                                                  "cardinality": copy.deepcopy(self.generators.get_specs()),
                                                   "index": 0,
                                                   "loss": float("inf")})
         coder_architect = Architect(internal_state={"any_change": False,
                                                     "updated_cardinality": False,
-                                                    "cardinality": copy.copy(self.coders.get_specs()),
+                                                    "cardinality": copy.deepcopy(self.coders.get_specs()),
                                                     "index": 0,
                                                     "loss": float("inf")})
 
@@ -1215,6 +1219,7 @@ class AdaptiveStageGAN:
                 # train epoch and get running metrics
                 losses, metrics, running, eval_running = self.process_epoch(
                     train_ds, eval_ds, epoch)
+
                 # optimize architectures
                 threshold = 0.1
                 loss_name = "critic_loss"
@@ -1225,6 +1230,8 @@ class AdaptiveStageGAN:
                 gan_architect.step(architect_input)
 
                 assert gan_architect.internal_state["cardinality"] == self.generators.get_specs(
+                ), "specs dont match"
+                assert gan_architect.internal_state["cardinality"] == self.critics.get_specs(
                 ), "specs dont match"
 
                 loss_name = "info_loss"
