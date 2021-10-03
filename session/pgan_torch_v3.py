@@ -1110,6 +1110,7 @@ class AdaptiveStageGAN:
                 else:
                     next_state = "increase_cardinality"
                 internal_state["last_change_loss"] = weighted_loss
+                internal_state["static_loss_timer"] = 5
         else:
             self.save_cp(epoch=epoch, losses=losses, backup=True, part=part)
             internal_state["static_loss_timer"] = 5
