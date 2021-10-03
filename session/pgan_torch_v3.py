@@ -1009,7 +1009,6 @@ class AdaptiveStageGAN:
 
     def decrease_gan_cardinality(self, input, internal_state):
         index = internal_state["index"]
-        internal_state["updated_cardinality"] = False
         if internal_state["cardinality"][self.image_shape] is None:
             internal_state["cardinality"][self.image_shape] = 1
         if internal_state["cardinality"][self.image_shape][index] > 1:
@@ -1024,7 +1023,7 @@ class AdaptiveStageGAN:
             new_state = "increase_depth"
         else:
             internal_state["index"] += 1
-            new_state = "train"
+            new_state = "increase_cardinality"
         return new_state, internal_state
 
     def increase_gan_cardinality(self, input, internal_state):
@@ -1038,7 +1037,6 @@ class AdaptiveStageGAN:
             self.generators.get_specs())
         self.specs["critic_specs"] = copy.deepcopy(self.critics.get_specs())
 
-        internal_state["updated_cardinality"] = True
         internal_state["any_change"] = True
         if internal_state["cardinality"][tuple(self.image_shape)] is None:
             internal_state["cardinality"][tuple(self.image_shape)] = [1]
@@ -1048,7 +1046,6 @@ class AdaptiveStageGAN:
 
     def decrease_coder_cardinality(self, input, internal_state):
         index = internal_state["index"]
-        internal_state["updated_cardinality"] = False
         if internal_state["cardinality"][self.image_shape] is None:
             internal_state["cardinality"][self.image_shape] = 1
         if internal_state["cardinality"][self.image_shape][index] > 1:
@@ -1061,14 +1058,13 @@ class AdaptiveStageGAN:
             new_state = "increase_depth"
         else:
             internal_state["index"] += 1
-            new_state = "train"
+            new_state = "increase_cardinality"
         return new_state, internal_state
 
     def increase_coder_cardinality(self, input, internal_state):
         index = internal_state["index"]
         self.coders.increase_cardinality(index, device=self.device)
         self.specs["coder_specs"] = self.coders.get_specs()
-        internal_state["updated_cardinality"] = True
         internal_state["any_change"] = True
         if internal_state["cardinality"][tuple(self.image_shape)] is None:
             internal_state["cardinality"][tuple(self.image_shape)] = [1]
@@ -1098,33 +1094,47 @@ class AdaptiveStageGAN:
         threshold = input["threshold"]
 
         loss = running[loss_name]
-        prev_loss = internal_state["loss"]
-        d_loss = abs(loss - prev_loss) / abs(loss)
+        exponential_weighting = 0.9
+        weighted_loss = internal_state["weighted_loss"]
+        weighted_loss = exponential_weighting * loss + \
+            (1 - exponential_weighting) * weighted_loss
+        d_loss = abs(weighted_loss -
+                     internal_state["weighted_loss"]) / abs(weighted_loss)
         if d_loss < threshold:
-            if internal_state["updated_cardinality"]:
-                next_state = "decrease_cardinality"
+            if internal_state["static_loss_timer"] > 0:
+                internal_state["static_loss_timer"] -= 1
+                next_state = "train"
             else:
-                next_state = "increase_cardinality"
+                if abs(internal_state["last_change_loss"] - weighted_loss) < threshold:
+                    next_state = "decrease_cardinality"
+                else:
+                    next_state = "increase_cardinality"
+                internal_state["last_change_loss"] = weighted_loss
         else:
             self.save_cp(epoch=epoch, losses=losses, backup=True, part=part)
-            internal_state["updated_cardinality"] = False
+            internal_state["static_loss_timer"] = 5
             next_state = "train"
 
         internal_state["loss"] = loss
+        internal_state["weighted_loss"] = weighted_loss
 
         return next_state, internal_state
 
     def init_architects(self):
         gan_architect = Architect(internal_state={"any_change": False,
-                                                  "updated_cardinality": False,
+                                                  "static_loss_timer": 5,
                                                   "cardinality": copy.deepcopy(self.generators.get_specs()),
                                                   "index": 0,
-                                                  "loss": float("inf")})
+                                                  "loss": 0,
+                                                  "weighted_loss": 0,
+                                                  "last_change_loss": 0})
         coder_architect = Architect(internal_state={"any_change": False,
-                                                    "updated_cardinality": False,
+                                                    "static_loss_timer": 5,
                                                     "cardinality": copy.deepcopy(self.coders.get_specs()),
                                                     "index": 0,
-                                                    "loss": float("inf")})
+                                                    "loss": 0,
+                                                    "weighted_loss": 0,
+                                                    "last_change_loss": 0})
 
         def reset_architect_index(input, internal_state):
             internal_state["index"] = 0
@@ -1288,7 +1298,7 @@ class AdaptiveStageGAN:
     def get_latest_checkpoint(self, backup=False, part='gan'):
         # default value
         pre = f"backup_{part}_checkpoint" if backup else f"{part}_checkpoint"
-        curr_checkpoint = f"{pre}_{self.start_image_shape[0]}_{self.start_image_shape[1]}.pth"
+        curr_checkpoint = f"{pre}_{self.image_shape[0]}_{self.image_shape[1]}.pth"
         if os.path.exists(self.cp_dir):
             # find latest checkpoint
 
