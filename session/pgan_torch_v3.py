@@ -206,7 +206,7 @@ class ConvTrans2dTransformer(DimsTransformer):
 
 
 class ResnextBranch(torch.nn.Module):
-    def __init__(self, in_shape, filters, activation='relu', c_axis=C_AXIS):
+    def __init__(self, in_shape, filters, activation='relu', c_axis=C_AXIS, device=None):
         super(ResnextBranch, self).__init__()
         self.filters = filters
         self.in_ch = in_shape[c_axis]
@@ -216,12 +216,12 @@ class ResnextBranch(torch.nn.Module):
                 "Resnext block only supports relu and leaky_relu activations")
         self.activation = activation
         self.in_conv1d = torch.nn.Conv2d(
-            self.in_ch, filters, kernel_size=(1, 1))
+            self.in_ch, filters, kernel_size=(1, 1), device=device)
         self.conv2d = torch.nn.Conv2d(filters, filters,
-                                      kernel_size=(3, 3), padding="same")
+                                      kernel_size=(3, 3), padding="same", device=device)
         self.out_conv1d = torch.nn.Conv2d(
-            filters, self.in_ch, kernel_size=(1, 1))
-        self.layer_norm = torch.nn.LayerNorm(in_shape[1:])
+            filters, self.in_ch, kernel_size=(1, 1), device=device)
+        self.layer_norm = torch.nn.LayerNorm(in_shape[1:], device=device)
 
     def forward(self, input):
         x = input[0]
@@ -239,7 +239,7 @@ class ResnextBranch(torch.nn.Module):
 
 
 class ResnextBlock(torch.nn.Module):
-    def __init__(self, in_shape, filters, cardinality=1, activation='relu', c_axis=C_AXIS, branch_weights=None):
+    def __init__(self, in_shape, filters, cardinality=1, activation='relu', c_axis=C_AXIS, device=None):
         super().__init__()
         self.cardinality = cardinality
         self.filters = filters
@@ -248,15 +248,12 @@ class ResnextBlock(torch.nn.Module):
         self.c_axis = c_axis
 
         self.branches = torch.nn.ModuleList()
+        self.branch_weights = torch.nn.ParameterList()
         for c in range(cardinality):
             self.branches.append(ResnextBranch(
-                in_shape, filters, activation=activation, c_axis=c_axis))
-
-        if branch_weights is None:
-            self.branch_weights = torch.nn.ParameterList(
-                [torch.nn.parameter.Parameter(torch.tensor(1, dtype=torch.float32), requires_grad=True)])
-        else:
-            self.branch_weights = branch_weights
+                in_shape, filters, activation=activation, c_axis=c_axis, device=device))
+            self.branch_weights.append(torch.nn.parameter.Parameter(
+                torch.tensor(1, dtype=torch.float32, device=device), requires_grad=True))
 
     def forward(self, input):
         x = input[0]
@@ -265,15 +262,15 @@ class ResnextBlock(torch.nn.Module):
             x = x + out_factor * branch([input[0], branch_weight])
         return x
 
-    def increase_cardinality(self):
+    def increase_cardinality(self, device=None):
         """
         increase the cardinality of this resnet block
         This is implemented for adaptive training where we increase the cardinality gradually
         """
         self.branches.append(ResnextBranch(
-            self.in_shape, self.filters, activation=self.activation, c_axis=self.c_axis))
+            self.in_shape, self.filters, activation=self.activation, c_axis=self.c_axis, device=device))
         self.branch_weights.append(torch.nn.parameter.Parameter(
-            torch.tensor(0, dtype=torch.float32), requires_grad=True))
+            torch.tensor(0, dtype=torch.float32, device=device), requires_grad=True))
 
     def decrease_cardinality(self):
         """
@@ -294,7 +291,7 @@ class ResnextBlock(torch.nn.Module):
 
 
 class AdaptiveResnext(torch.nn.Module):
-    def __init__(self, in_shape, filters, activation='relu', c_axis=C_AXIS, spec=None):
+    def __init__(self, in_shape, filters, activation='relu', c_axis=C_AXIS, spec=None, device=None):
         super().__init__()
         self.filters = filters
         self.activation = activation
@@ -306,9 +303,9 @@ class AdaptiveResnext(torch.nn.Module):
         self.blocks = torch.nn.ModuleList()
         for cardinality in self.spec:
             self.out_factors.append(torch.nn.parameter.Parameter(
-                torch.tensor(1, dtype=torch.float32), requires_grad=True))
+                torch.tensor(1, dtype=torch.float32, device=device), requires_grad=True))
             self.blocks.append(ResnextBlock(self.in_shape, self.filters, cardinality,
-                                            activation=activation, c_axis=self.c_axis))
+                                            activation=activation, c_axis=self.c_axis, device=device))
 
     def forward(self, input):
         x = input
@@ -316,23 +313,23 @@ class AdaptiveResnext(torch.nn.Module):
             x = block([x, h])
         return x
 
-    def increase_depth(self):
+    def increase_depth(self, device=None):
         """
         increase the depth of this resnet by 1.
         This is implemented for adaptive training where we increase the depth gradually
         """
         self.out_factors.append(torch.nn.parameter.Parameter(
-            torch.tensor(0, dtype=torch.float32), requires_grad=True))
+            torch.tensor(0, dtype=torch.float32, device=device), requires_grad=True))
         self.blocks.append(ResnextBlock(
-            self.in_shape, self.filters, activation=self.activation, c_axis=self.c_axis))
+            self.in_shape, self.filters, activation=self.activation, c_axis=self.c_axis, device=device))
         self.spec.append(1)
 
-    def increase_cardinality(self, block_index=-1):
+    def increase_cardinality(self, block_index=-1, device=None):
         """
         return a copy of this resnet with cardinality increased by 1 on the last block.
         This is implemented for adaptive training where we increase the depth gradually
         """
-        self.blocks[block_index].increase_cardinality()
+        self.blocks[block_index].increase_cardinality(device=device)
         self.spec[block_index] += 1
 
     def decrease_cardinality(self, block_index=-1):
@@ -406,11 +403,11 @@ class Critic(torch.nn.Module):
     def get_spec(self):
         return self.trunk.spec
 
-    def increase_depth(self):
-        self.trunk.increase_depth()
+    def increase_depth(self, device=None):
+        self.trunk.increase_depth(device=device)
 
-    def increase_cardinality(self, index):
-        self.trunk.increase_cardinality(index)
+    def increase_cardinality(self, index, device=None):
+        self.trunk.increase_cardinality(index, device=device)
 
     def decrease_cardinality(self, index):
         self.trunk.decrease_cardinality(index)
@@ -457,11 +454,11 @@ class Coder(torch.nn.Module):
     def get_spec(self):
         return self.trunk.spec
 
-    def increase_depth(self):
-        self.trunk.increase_depth()
+    def increase_depth(self, device=None):
+        self.trunk.increase_depth(device=device)
 
-    def increase_cardinality(self, index):
-        self.trunk.increase_cardinality(index)
+    def increase_cardinality(self, index, device=None):
+        self.trunk.increase_cardinality(index, device=device)
 
     def decrease_cardinality(self, index):
         self.trunk.decrease_cardinality(index)
@@ -499,11 +496,11 @@ class Generator(torch.nn.Module):
     def get_spec(self):
         return self.trunk.spec
 
-    def increase_depth(self):
-        self.trunk.increase_depth()
+    def increase_depth(self, device=None):
+        self.trunk.increase_depth(device=device)
 
-    def increase_cardinality(self, index):
-        self.trunk.increase_cardinality(index)
+    def increase_cardinality(self, index, device=None):
+        self.trunk.increase_cardinality(index, device=device)
 
     def decrease_cardinality(self, index):
         self.trunk.decrease_cardinality(index)
@@ -579,12 +576,13 @@ class GeneratorCollection(torch.nn.Module):
         self.current_training_index = 0 if index < 0 else index
         self.out_dims = self.generators[index].out_dims
 
-    def increase_depth(self):
-        self.generators[self.current_training_index].increase_depth()
+    def increase_depth(self, device=None):
+        self.generators[self.current_training_index].increase_depth(
+            device=device)
 
-    def increase_cardinality(self, index):
+    def increase_cardinality(self, index, device=None):
         self.generators[self.current_training_index].increase_cardinality(
-            index)
+            index, device=device)
 
     def decrease_cardinality(self, index):
         self.generators[self.current_training_index].decrease_cardinality(
@@ -651,11 +649,12 @@ class CriticCollection(torch.nn.Module):
     def set_training_index(self, index):
         self.current_training_index = index
 
-    def increase_depth(self):
-        self.critics[self.current_training_index].increase_depth()
+    def increase_depth(self, device=None):
+        self.critics[self.current_training_index].increase_depth(device=device)
 
-    def increase_cardinality(self, index):
-        self.critics[self.current_training_index].increase_cardinality(index)
+    def increase_cardinality(self, index, device=None):
+        self.critics[self.current_training_index].increase_cardinality(
+            index, device=device)
 
     def decrease_cardinality(self, index):
         self.critics[self.current_training_index].decrease_cardinality(index)
@@ -727,11 +726,12 @@ class CoderCollection(torch.nn.Module):
                  for i in range(len(self.coders))}
         return specs
 
-    def increase_depth(self):
-        self.coders[self.current_training_index].increase_depth()
+    def increase_depth(self, device=None):
+        self.coders[self.current_training_index].increase_depth(device=device)
 
-    def increase_cardinality(self, index):
-        self.coders[self.current_training_index].increase_cardinality(index)
+    def increase_cardinality(self, index, device=None):
+        self.coders[self.current_training_index].increase_cardinality(
+            index, device=device)
 
     def decrease_cardinality(self, index):
         self.coders[self.current_training_index].decrease_cardinality(index)
@@ -988,7 +988,7 @@ class AdaptiveStageGAN:
         return losses, metrics, last_running, last_eval_running
 
     def increase_coder_depth(self, input, internal_state):
-        self.coders.increase_depth()
+        self.coders.increase_depth(device=self.device)
         internal_state["cardinality"][self.image_shape].append(1)
         internal_state["index"] = 0
         internal_state["any_change"] = True
@@ -997,8 +997,8 @@ class AdaptiveStageGAN:
         return new_state, internal_state
 
     def increase_gan_depth(self, input, internal_state):
-        self.generators.increase_depth()
-        self.critics.increase_depth()
+        self.generators.increase_depth(device=self.device)
+        self.critics.increase_depth(device=self.device)
         self.specs["generator_specs"] = self.generators.get_specs()
         self.specs["critic_specs"] = self.critics.get_specs()
         internal_state["cardinality"][self.image_shape].append(1)
@@ -1029,8 +1029,8 @@ class AdaptiveStageGAN:
 
     def increase_gan_cardinality(self, input, internal_state):
         index = internal_state["index"]
-        self.generators.increase_cardinality(index)
-        self.critics.increase_cardinality(index)
+        self.generators.increase_cardinality(index, device=self.device)
+        self.critics.increase_cardinality(index, device=self.device)
 
         assert self.generators.get_specs() == self.critics.get_specs()
 
@@ -1066,7 +1066,7 @@ class AdaptiveStageGAN:
 
     def increase_coder_cardinality(self, input, internal_state):
         index = internal_state["index"]
-        self.coders.increase_cardinality(index)
+        self.coders.increase_cardinality(index, device=self.device)
         self.specs["coder_specs"] = self.coders.get_specs()
         internal_state["updated_cardinality"] = True
         internal_state["any_change"] = True
@@ -1287,7 +1287,7 @@ class AdaptiveStageGAN:
 
     def get_latest_checkpoint(self, backup=False, part='gan'):
         # default value
-        pre = f"{part}_backup_checkpoint" if backup else f"{part}_checkpoint"
+        pre = f"backup_{part}_checkpoint" if backup else f"{part}_checkpoint"
         curr_checkpoint = f"{pre}_{self.start_image_shape[0]}_{self.start_image_shape[1]}.pth"
         if os.path.exists(self.cp_dir):
             # find latest checkpoint
